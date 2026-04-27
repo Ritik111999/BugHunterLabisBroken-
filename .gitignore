@@ -1,0 +1,50 @@
+# Logs
+*.log
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE / Editor
+/.fleet
+/.idea
+/.vscode
+/.zed
+
+# PHP / Laravel
+/vendor
+/storage/*.key
+/storage/pail
+/public/storage
+/public/hot
+/public/build
+
+# Cache / Testing
+.phpunit.result.cache
+/.phpunit.cache
+
+# Node
+/node_modules
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python (you have scripts)
+/__pycache__/
+*.pyc
+
+# Auth / Secrets
+auth.json
+
+# Laravel Sail / Homestead
+Homestead.json
+Homestead.yaml
+
+# Misc
+zip/
+*.zip

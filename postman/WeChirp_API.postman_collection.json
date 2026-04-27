@@ -1,0 +1,167 @@
+{
+  "info": {
+    "_postman_id": "c1c0b10b-7f60-4f5e-9b02-7b9c2c10f3fd",
+    "name": "WeChirp API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Auth - Signup",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/api/signup",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"Rajat\",\n  \"email\": \"rajat@example.com\",\n  \"password\": \"password\",\n  \"password_confirmation\": \"password\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Auth - Login",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.token) {",
+              "  pm.environment.set('token', json.token);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/api/login",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"rajat@example.com\",\n  \"password\": \"password\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Meetings - Create",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.id) {",
+              "  pm.environment.set('meetingId', json.id);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/api/meetings",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"Demo Meeting\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Audio - Upload Chunk (HTTP)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": "{{baseUrl}}/api/audio/chunk",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "meeting_id", "value": "{{meetingId}}", "type": "text" },
+            { "key": "chunk_index", "value": "0", "type": "text" },
+            { "key": "audio", "type": "file", "src": "" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Meeting Stats - Latest (DB)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": "{{baseUrl}}/api/meetings/{{meetingId}}/stats"
+      }
+    },
+    {
+      "name": "Meeting Stats - Stream (SSE)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": "{{baseUrl}}/api/meetings/{{meetingId}}/stats/stream"
+      }
+    },
+    {
+      "name": "Speakers - List mappings",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": "{{baseUrl}}/api/meetings/{{meetingId}}/speakers"
+      }
+    },
+    {
+      "name": "Speakers - Map speaker label to name",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": "{{baseUrl}}/api/meetings/{{meetingId}}/speakers/map",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"speaker_label\": \"speaker_0\",\n  \"name\": \"Rajat\",\n  \"confidence\": 0.8\n}"
+        }
+      }
+    },
+    {
+      "name": "Transcripts - List (last 50)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": "{{baseUrl}}/api/meetings/{{meetingId}}/transcripts"
+      }
+    },
+    {
+      "name": "Deepgram Live Relay - WebSocket (connect)",
+      "request": {
+        "method": "GET",
+        "url": "ws://127.0.0.1:8086/meetings/{{meetingId}}/live?token={{token}}"
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8000" },
+    { "key": "token", "value": "" },
+    { "key": "meetingId", "value": "" }
+  ]
+}
+
