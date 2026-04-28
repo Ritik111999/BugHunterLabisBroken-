@@ -32,7 +32,7 @@ class AudioChunkController extends Controller
             meetingId: $meetingId,
             filePath: $filePath,
             chunkIndex: $chunkIndex,
-        )->onQueue('audio');
+        )->onQueue('default');
 
         return response()->json([
             'status' => 'queued',

@@ -20,37 +20,18 @@ class IntroChunkController extends Controller
         $validated = $request->validate([
             'chunk_index' => ['required', 'integer', 'min:0'],
             'audio' => ['required', 'file', 'max:51200'],
+            'duration_seconds' => ['nullable', 'numeric', 'min:1', 'max:60'],
         ]);
 
         $chunkIndex = (int) $validated['chunk_index'];
+        $durationSeconds = isset($validated['duration_seconds']) ? (float) $validated['duration_seconds'] : null;
         $sync = filter_var($request->query('sync', true), FILTER_VALIDATE_BOOL);
 
         $filePath = $this->storeChunkFile($request, $id, $chunkIndex);
 
         if ($sync) {
-            try {
-                (new ProcessChunkJob(
-                    meetingId: $id,
-                    filePath: $filePath,
-                    chunkIndex: $chunkIndex,
-                    mode: 'intro',
-                ))->handle();
-
-                return response()->json([
-                    'status' => 'processed',
-                    'meeting_id' => $id,
-                    'chunk_index' => $chunkIndex,
-                    'mode' => 'intro',
-                ], 200);
-            } catch (\Throwable $e) {
-                return response()->json([
-                    'status' => 'failed',
-                    'meeting_id' => $id,
-                    'chunk_index' => $chunkIndex,
-                    'mode' => 'intro',
-                    'error' => $e->getMessage(),
-                ], 200);
-            }
+            // Intro processing can be slow (Deepgram + Python + model load).
+            // For UX, prefer async by default even when sync=1 is provided.
         }
 
         ProcessChunkJob::dispatch(
@@ -58,7 +39,8 @@ class IntroChunkController extends Controller
             filePath: $filePath,
             chunkIndex: $chunkIndex,
             mode: 'intro',
-        )->onQueue('audio');
+            durationSeconds: $durationSeconds,
+        )->onQueue('default');
 
         return response()->json([
             'status' => 'queued',

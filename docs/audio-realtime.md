@@ -21,6 +21,13 @@ Those labels are **not real names**. We convert them to real names using:
 - Stored mapping in DB:
   - `speaker_mappings.speaker_label` → `meeting_participants.id`
 
+### Voice recognition (voiceprints)
+
+If `scripts/analyze_audio.py` can load SpeechBrain (via `scripts/.venv`) it will also emit
+`speaker_embeddings` (voiceprints). During meeting processing we match those voiceprints
+against enrolled participants' stored `voice_embedding.voiceprint` to recognize who is talking
+without requiring "my name is X" during the meeting.
+
 ### Crosstalk
 
 Crosstalk is computed as:
@@ -40,6 +47,7 @@ Deepgram provides timings (words/utterances), and we compute overlaps.
 - Worker job: `ProcessChunkJob`
 - Analyzer: `scripts/analyze_audio.py`
   - uses Deepgram prerecorded `listen` API when `DEEPGRAM_API_KEY` is set
+  - computes speaker voiceprints when SpeechBrain is available (recommended: use `scripts/.venv`)
 
 **DB updates**
 - `meeting_participants` (placeholder `Speaker N`, renamed when intro detected)
@@ -60,6 +68,8 @@ php artisan deepgram:relay --host=127.0.0.1 --port=8089
 
 - Client sends **binary audio frames**.
 - Relay forwards to **Deepgram Live** and updates DB continuously.
+- Relay also computes **voiceprints** from incoming MediaRecorder chunks (SpeechBrain) and
+  matches live `speaker_0`/`speaker_1` to enrolled participants when confident.
 
 ---
 

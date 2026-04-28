@@ -7,7 +7,9 @@ Output JSON to stdout with:
 {
   "total_seconds": <int>,              # analyzed window length (after intro trim)
   "speakers": { "Rajat": 12, ... },    # speaking seconds per speaker (diarization)
-  "overlap_seconds": <int>             # estimated overlap seconds (crosstalk)
+  "overlap_seconds": <int>,            # estimated overlap seconds (crosstalk)
+  "speaker_text": { "speaker_0": "..." },
+  "speaker_embeddings": { "speaker_0": [<float>, ...] }   # optional (voice recognition)
 }
 
 Notes:
@@ -23,6 +25,9 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
+import wave
+from array import array
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -90,7 +95,13 @@ def _compute_overlap_seconds(intervals: List[Tuple[float, float]]) -> int:
     return int(math.floor(max(0.0, overlap)))
 
 
-def run_diarization(path: str, intro_seconds: float, timeout: int, deepgram_key_override: Optional[str] = None) -> Tuple[Dict[str, int], int, Dict[str, str], Optional[float]]:
+def run_diarization(
+    path: str,
+    intro_seconds: float,
+    timeout: int,
+    deepgram_key_override: Optional[str] = None,
+    mode: str = "meeting",
+) -> Tuple[Dict[str, int], int, Dict[str, str], Dict[str, List[Tuple[float, float]]], Optional[float]]:
     """
     Deduces speaker talk time and overlap seconds.
 
@@ -100,11 +111,258 @@ def run_diarization(path: str, intro_seconds: float, timeout: int, deepgram_key_
     """
     deepgram_key = (deepgram_key_override or os.getenv("DEEPGRAM_API_KEY", "")).strip()
     if deepgram_key:
-        return run_deepgram_diarization(path, intro_seconds=intro_seconds, timeout=timeout, api_key=deepgram_key)
+        return run_deepgram_diarization(path, intro_seconds=intro_seconds, timeout=timeout, api_key=deepgram_key, mode=mode)
     raise ImportError("No diarization provider configured")
 
 
-def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_key: str) -> Tuple[Dict[str, int], int, Dict[str, str], Optional[float]]:
+def _merge_intervals(intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: (x[0], x[1]))
+    out: List[Tuple[float, float]] = []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            out.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    out.append((cur_s, cur_e))
+    return out
+
+
+def _convert_to_wav_mono_16k(src_path: str, timeout: int) -> str:
+    """
+    Convert to a temporary 16kHz mono WAV so torchaudio can load consistently.
+    Returns wav path; caller must delete it.
+    """
+    fd, wav_path = tempfile.mkstemp(prefix="wchirp_", suffix=".wav")
+    os.close(fd)
+    cp = run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            src_path,
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            wav_path,
+        ],
+        timeout=timeout,
+    )
+    if cp.returncode != 0:
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+        raise RuntimeError(cp.stderr.strip() or "ffmpeg convert failed")
+    return wav_path
+
+
+def _load_wav_mono_16k(path: str) -> "tuple[list[float], int]":
+    """
+    Load a mono 16kHz 16-bit PCM WAV as float samples in [-1,1].
+    Uses stdlib only (avoids torchaudio TorchCodec dependency).
+    """
+    with wave.open(path, "rb") as wf:
+        ch = wf.getnchannels()
+        sr = wf.getframerate()
+        sampwidth = wf.getsampwidth()
+        n = wf.getnframes()
+        if ch != 1:
+            raise RuntimeError(f"expected mono wav, got channels={ch}")
+        if sr != 16000:
+            raise RuntimeError(f"expected 16k wav, got sr={sr}")
+        if sampwidth != 2:
+            raise RuntimeError(f"expected 16-bit PCM wav, got sampwidth={sampwidth}")
+        frames = wf.readframes(n)
+
+    pcm = array("h")
+    pcm.frombytes(frames)
+    if sys.byteorder != "little":
+        pcm.byteswap()
+
+    return [max(-1.0, min(1.0, v / 32768.0)) for v in pcm], sr
+
+
+def _compute_speaker_embeddings(
+    audio_path: str,
+    speaker_intervals: Dict[str, List[Tuple[float, float]]],
+    intro_seconds: float,
+    timeout: int,
+) -> Dict[str, List[float]]:
+    """
+    Compute a voiceprint embedding per speaker label using SpeechBrain ECAPA.
+    Returns label -> embedding(float list). If deps missing, returns {}.
+    """
+    try:
+        import torch  # type: ignore
+        from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
+    except Exception:
+        return {}
+
+    wav_path = None
+    try:
+        wav_path = _convert_to_wav_mono_16k(audio_path, timeout=timeout)
+        samples, sr = _load_wav_mono_16k(wav_path)
+        wav = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)  # [1, T]
+
+        # Trim intro seconds from the waveform so interval times line up.
+        if intro_seconds > 0:
+            cut = int(max(0.0, intro_seconds) * sr)
+            wav = wav[:, min(cut, wav.shape[1]) :]
+
+        # SpeechBrain model (downloads on first run).
+        classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cpu"},
+        )
+
+        out: Dict[str, List[float]] = {}
+        for label, intervals in speaker_intervals.items():
+            merged = _merge_intervals([(float(s), float(e)) for s, e in intervals if e > s])
+            if not merged:
+                continue
+
+            # Concatenate up to ~20s of audio to avoid huge compute on long chunks.
+            pieces = []
+            total_s = 0.0
+            for s, e in merged:
+                if total_s >= 20.0:
+                    break
+                s_i = int(max(0.0, s) * sr)
+                e_i = int(max(0.0, e) * sr)
+                if e_i <= s_i:
+                    continue
+                seg = wav[:, s_i:e_i]
+                dur = (e_i - s_i) / sr
+                if dur < 0.5:
+                    continue
+                pieces.append(seg)
+                total_s += dur
+
+            if not pieces:
+                continue
+
+            audio = torch.cat(pieces, dim=1)  # [1, T]
+            if audio.shape[1] < int(1.0 * sr):
+                continue
+
+            with torch.inference_mode():
+                emb = classifier.encode_batch(audio)  # [1, 1, D] or [1, D]
+                if emb.dim() == 3:
+                    emb = emb[0, 0, :]
+                elif emb.dim() == 2:
+                    emb = emb[0, :]
+                emb = emb.float()
+                emb = emb / (emb.norm(p=2) + 1e-12)
+
+            out[str(label)] = [float(x) for x in emb.cpu().tolist()]
+
+        return out
+    finally:
+        if wav_path:
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
+
+
+def _compute_global_embedding(audio_path: str, intro_seconds: float, timeout: int, max_seconds: Optional[float] = None) -> Optional[List[float]]:
+    """
+    Compute a single normalized voiceprint for the whole clip (after intro trim).
+    Used to speed up intro enrollment when diarization intervals are missing.
+    """
+    try:
+        import torch  # type: ignore
+        from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
+    except Exception:
+        return None
+
+    wav_path = None
+    try:
+        wav_path = _convert_to_wav_mono_16k_loudnorm(audio_path, timeout=timeout, max_seconds=max_seconds)
+        samples, sr = _load_wav_mono_16k(wav_path)
+        wav = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)  # [1, T]
+
+        if intro_seconds > 0:
+            cut = int(max(0.0, intro_seconds) * sr)
+            wav = wav[:, min(cut, wav.shape[1]) :]
+
+        if wav.shape[1] < int(1.0 * sr):
+            return None
+
+        classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cpu"},
+        )
+
+        with torch.inference_mode():
+            emb = classifier.encode_batch(wav)
+            if emb.dim() == 3:
+                emb = emb[0, 0, :]
+            elif emb.dim() == 2:
+                emb = emb[0, :]
+            emb = emb.float()
+            emb = emb / (emb.norm(p=2) + 1e-12)
+
+        return [float(x) for x in emb.cpu().tolist()]
+    finally:
+        if wav_path:
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
+
+
+def _convert_to_wav_mono_16k_loudnorm(src_path: str, timeout: int, max_seconds: Optional[float] = None) -> str:
+    """
+    Convert to a temporary 16kHz mono WAV and normalize loudness.
+    This makes quiet mic recordings transcribe better.
+    """
+    fd, wav_path = tempfile.mkstemp(prefix="wchirp_norm_", suffix=".wav")
+    os.close(fd)
+    cp = run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            src_path,
+            *([] if max_seconds is None else ["-t", str(float(max_seconds))]),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-af",
+            "loudnorm=I=-16:LRA=11:TP=-1.5",
+            wav_path,
+        ],
+        timeout=timeout,
+    )
+    if cp.returncode != 0:
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+        raise RuntimeError(cp.stderr.strip() or "ffmpeg loudnorm failed")
+    return wav_path
+
+
+def run_deepgram_diarization(
+    path: str,
+    intro_seconds: float,
+    timeout: int,
+    api_key: str,
+    mode: str = "meeting",
+) -> Tuple[Dict[str, int], int, Dict[str, str], Dict[str, List[Tuple[float, float]]], Optional[float]]:
     """
     Uses Deepgram diarization. Returns (speaker_seconds, overlap_seconds).
     Speaker keys are "speaker_0", "speaker_1", ...
@@ -117,22 +375,30 @@ def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_
     }
     url = "https://api.deepgram.com/v1/listen?" + urllib.parse.urlencode(params)
 
-    with open(path, "rb") as f:
+    # For intro enrollment, normalize loudness to avoid "speak very loud" issues.
+    # We send WAV to Deepgram for maximum compatibility.
+    temp_norm = None
+    send_path = path
+    if str(mode).lower() == "intro":
+        temp_norm = _convert_to_wav_mono_16k_loudnorm(path, timeout=timeout, max_seconds=None)
+        send_path = temp_norm
+
+    with open(send_path, "rb") as f:
         audio_bytes = f.read()
 
-    content_type = "audio/*"
-    lower = path.lower()
-    if lower.endswith(".webm"):
-        # Deepgram can be picky; include codec hint for MediaRecorder chunks.
+    lower = send_path.lower()
+    if lower.endswith(".wav"):
+        content_type = "audio/wav"
+    elif lower.endswith(".webm"):
         content_type = "audio/webm;codecs=opus"
     elif lower.endswith(".ogg") or lower.endswith(".oga"):
         content_type = "audio/ogg;codecs=opus"
     elif lower.endswith(".mp3"):
         content_type = "audio/mpeg"
-    elif lower.endswith(".wav"):
-        content_type = "audio/wav"
     elif lower.endswith(".m4a") or lower.endswith(".mp4"):
         content_type = "audio/mp4"
+    else:
+        content_type = "audio/*"
 
     req = urllib.request.Request(
         url=url,
@@ -161,6 +427,7 @@ def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_
     data = json.loads(payload)
     per_speaker_seconds: Dict[str, float] = {}
     per_speaker_text: Dict[str, str] = {}
+    per_speaker_intervals: Dict[str, List[Tuple[float, float]]] = {}
     all_intervals: List[Tuple[float, float]] = []
 
     results = (data or {}).get("results") or {}
@@ -182,6 +449,7 @@ def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_
 
             key = f"speaker_{int(speaker) if speaker is not None else 0}"
             per_speaker_seconds[key] = per_speaker_seconds.get(key, 0.0) + (end - start)
+            per_speaker_intervals.setdefault(key, []).append((start, end))
             all_intervals.append((start, end))
             t = str(u.get("transcript") or "").strip()
             if t:
@@ -196,8 +464,19 @@ def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_
             words = []
 
         if not isinstance(words, list) or len(words) == 0:
+            # If Deepgram didn't return word timings, we may still have a plain transcript.
+            # Use it so "my name is X" can work even without diarization timings.
+            transcript = ""
+            try:
+                transcript = str(channels[0]["alternatives"][0].get("transcript") or "").strip()
+            except Exception:
+                transcript = ""
+
+            if transcript:
+                return {}, 0, {"speaker_0": transcript}, {}, 0.0
+
             # Common when chunk is silence/no speech. Don't fail the pipeline; treat as no speech.
-            return {}, 0, {}, 0.0
+            return {}, 0, {}, {}, 0.0
 
         for w in words:
             if not isinstance(w, dict):
@@ -213,6 +492,7 @@ def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_
 
             key = f"speaker_{int(speaker) if speaker is not None else 0}"
             per_speaker_seconds[key] = per_speaker_seconds.get(key, 0.0) + (end - start)
+            per_speaker_intervals.setdefault(key, []).append((start, end))
             all_intervals.append((start, end))
             t = str(w.get("punctuated_word") or w.get("word") or "").strip()
             if t:
@@ -224,7 +504,14 @@ def run_deepgram_diarization(path: str, intro_seconds: float, timeout: int, api_
     inferred_duration = None
     if len(all_intervals) > 0:
         inferred_duration = max(e for _s, e in all_intervals)
-    return speaker_seconds_int, overlap_seconds, per_speaker_text, inferred_duration
+    try:
+        return speaker_seconds_int, overlap_seconds, per_speaker_text, per_speaker_intervals, inferred_duration
+    finally:
+        if temp_norm:
+            try:
+                os.unlink(temp_norm)
+            except Exception:
+                pass
 
 
 def main() -> int:
@@ -233,6 +520,8 @@ def main() -> int:
     parser.add_argument("--intro-seconds", type=float, default=0.0)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--deepgram-key", type=str, default="")
+    parser.add_argument("--mode", type=str, default="meeting")
+    parser.add_argument("--max-seconds", type=float, default=0.0)
     args = parser.parse_args()
 
     path = args.file
@@ -254,8 +543,8 @@ def main() -> int:
             ffprobe_error = e
 
         try:
-            speakers, overlap, speaker_text, inferred_duration = run_diarization(
-                path, args.intro_seconds, args.timeout, deepgram_key_override=deepgram_key
+            speakers, overlap, speaker_text, speaker_intervals, inferred_duration = run_diarization(
+                path, args.intro_seconds, args.timeout, deepgram_key_override=deepgram_key, mode=str(args.mode or "meeting")
             )
         except Exception:
             if deepgram_enabled:
@@ -267,6 +556,7 @@ def main() -> int:
             speakers = {"Unknown": total_after_intro}
             overlap = 0
             speaker_text = {}
+            speaker_intervals = {}
             inferred_duration = float(total_after_intro)
 
         if total_after_intro is None:
@@ -274,11 +564,34 @@ def main() -> int:
                 raise ffprobe_error or RuntimeError("Unable to infer duration")
             total_after_intro = analyzed_window(inferred_duration, 0.0)
 
+        speaker_embeddings: Dict[str, List[float]] = {}
+        if deepgram_enabled and isinstance(speaker_intervals, dict) and len(speaker_intervals) > 0:
+            speaker_embeddings = _compute_speaker_embeddings(
+                audio_path=path,
+                speaker_intervals=speaker_intervals,
+                intro_seconds=float(args.intro_seconds),
+                timeout=int(args.timeout),
+            )
+
+        max_s = float(args.max_seconds or 0.0)
+        max_s = None if max_s <= 0 else max(1.0, min(60.0, max_s))
+
+        global_embedding = None
+        if str(args.mode or "").lower() == "intro":
+            global_embedding = _compute_global_embedding(
+                audio_path=path,
+                intro_seconds=float(args.intro_seconds),
+                timeout=int(args.timeout),
+                max_seconds=max_s,
+            )
+
         out = {
             "total_seconds": int(total_after_intro),
             "speakers": {str(k): int(v) for k, v in speakers.items()},
             "overlap_seconds": int(overlap),
             "speaker_text": {str(k): str(v) for k, v in (speaker_text or {}).items()},
+            "speaker_embeddings": speaker_embeddings,
+            "global_embedding": global_embedding,
         }
         print(json.dumps(out))
         return 0

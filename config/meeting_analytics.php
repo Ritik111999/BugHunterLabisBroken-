@@ -16,8 +16,25 @@ return [
 
     // Python analyzer entrypoint. Must output JSON to stdout.
     'analyzer' => [
-        'python' => env('MEETING_ANALYZER_PYTHON', 'python3'),
-        'script' => env('MEETING_ANALYZER_SCRIPT', base_path('scripts/analyze_audio.py')),
+        'python' => (function (): string {
+            $python = (string) env('MEETING_ANALYZER_PYTHON', '');
+            $python = trim($python);
+            if ($python !== '') {
+                return $python;
+            }
+
+            $venvPython = base_path('scripts/.venv/bin/python');
+            return file_exists($venvPython) ? $venvPython : 'python3';
+        })(),
+        'script' => (function (): string {
+            $script = (string) env('MEETING_ANALYZER_SCRIPT', '');
+            $script = trim($script);
+            if ($script !== '') {
+                return $script;
+            }
+
+            return base_path('scripts/analyze_audio.py');
+        })(),
         'timeout_seconds' => (int) env('MEETING_ANALYZER_TIMEOUT', 60),
     ],
 ];

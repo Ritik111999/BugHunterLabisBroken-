@@ -29,13 +29,21 @@ class ProcessChunkJob implements ShouldQueue
     public ?string $filePath;
     public int $chunkIndex;
     public string $mode;
+    public ?float $durationSeconds = null;
 
-    public function __construct(int $meetingId, ?string $filePath = null, int $chunkIndex = 0, string $mode = 'meeting')
+    public function __construct(
+        int $meetingId,
+        ?string $filePath = null,
+        int $chunkIndex = 0,
+        string $mode = 'meeting',
+        ?float $durationSeconds = null
+    )
     {
         $this->meetingId = $meetingId;
         $this->filePath = $filePath;
         $this->chunkIndex = $chunkIndex;
         $this->mode = $mode;
+        $this->durationSeconds = $durationSeconds;
     }
 
     public function handle(): void
@@ -54,6 +62,8 @@ class ProcessChunkJob implements ShouldQueue
                     'users' => [],
                     'crosstalk' => 0,
                     'speaker_text' => [],
+                    'speaker_embeddings' => [],
+                    'global_embedding' => null,
                 ]);
 
                 $stats = $this->applyAnalysisToStats($stats, $analysis);
@@ -156,6 +166,12 @@ class ProcessChunkJob implements ShouldQueue
             (string) $introSeconds,
             '--timeout',
             (string) $timeout,
+            '--deepgram-key',
+            $deepgramKey,
+            '--mode',
+            $this->mode,
+            '--max-seconds',
+            (string) ($this->durationSeconds ?? 0),
         ]);
         $process->setEnv(array_merge($_SERVER, $_ENV, [
             'DEEPGRAM_API_KEY' => $deepgramKey,
@@ -197,6 +213,7 @@ class ProcessChunkJob implements ShouldQueue
         $speakers = is_array($decoded['speakers'] ?? null) ? $decoded['speakers'] : [];
         $overlapSeconds = (int) ($decoded['overlap_seconds'] ?? 0);
         $speakerText = is_array($decoded['speaker_text'] ?? null) ? $decoded['speaker_text'] : [];
+        $globalEmbedding = is_array($decoded['global_embedding'] ?? null) ? $decoded['global_embedding'] : null;
 
         $normalizedSpeakers = [];
         foreach ($speakers as $name => $seconds) {
@@ -207,15 +224,12 @@ class ProcessChunkJob implements ShouldQueue
             throw new \RuntimeException('Analyzer did not diarize (Unknown speaker).');
         }
 
-        if ($this->mode === 'intro' && count($speakerText) === 0) {
-            throw new \RuntimeException('Intro enrollment failed: analyzer returned no transcript text (speaker_text is empty).');
-        }
-
         return [
             'total_seconds' => max(0, $totalSeconds),
             'speakers' => $normalizedSpeakers,
             'overlap_seconds' => max(0, $overlapSeconds),
             'speaker_text' => array_map(fn ($v) => (string) $v, $speakerText),
+            'global_embedding' => $globalEmbedding,
         ];
     }
 
@@ -228,6 +242,7 @@ class ProcessChunkJob implements ShouldQueue
 
         $analysisSpeakers = is_array($analysis['speakers'] ?? null) ? $analysis['speakers'] : [];
         $analysisSpeakerText = is_array($analysis['speaker_text'] ?? null) ? $analysis['speaker_text'] : [];
+        $analysisSpeakerEmbeddings = is_array($analysis['speaker_embeddings'] ?? null) ? $analysis['speaker_embeddings'] : [];
 
         foreach ($analysisSpeakers as $speaker => $seconds) {
             // FIX #2: Namespace speaker labels by chunk index so speaker_0 in chunk 1
@@ -247,6 +262,25 @@ class ProcessChunkJob implements ShouldQueue
                 continue;
             }
             $stats['speaker_text'][$scopedLabel] = trim(((string) ($stats['speaker_text'][$scopedLabel] ?? '')) . ' ' . $text);
+        }
+
+        // Store latest speaker embeddings per scoped label (for voice recognition).
+        $stats['speaker_embeddings'] = is_array($stats['speaker_embeddings'] ?? null) ? $stats['speaker_embeddings'] : [];
+        foreach ($analysisSpeakerEmbeddings as $label => $embedding) {
+            $scopedLabel = 'chunk' . $this->chunkIndex . '_' . (string) $label;
+            if (!is_array($embedding) || count($embedding) === 0) {
+                continue;
+            }
+            $vec = [];
+            foreach ($embedding as $v) {
+                if (is_numeric($v)) {
+                    $vec[] = (float) $v;
+                }
+            }
+            if (count($vec) === 0) {
+                continue;
+            }
+            $stats['speaker_embeddings'][$scopedLabel] = $vec;
         }
 
         return $stats;
@@ -447,11 +481,16 @@ class ProcessChunkJob implements ShouldQueue
 
         $users = is_array($stats['users'] ?? null) ? $stats['users'] : [];
         $speakerText = is_array($stats['speaker_text'] ?? null) ? $stats['speaker_text'] : [];
+        $speakerEmbeddings = is_array($stats['speaker_embeddings'] ?? null) ? $stats['speaker_embeddings'] : [];
+        $globalEmbedding = is_array($stats['global_embedding'] ?? null) ? $stats['global_embedding'] : null;
 
-        DB::transaction(function () use ($meeting, $meetingId, $users, $participants, $crosstalkPercentage, $speakerText) {
+        DB::transaction(function () use ($meeting, $meetingId, $users, $participants, $crosstalkPercentage, $speakerText, $speakerEmbeddings, $globalEmbedding) {
             $isIntroMode = $this->mode === 'intro' || (string) ($meeting->status ?? '') === 'pending';
 
             $labelToParticipantId = [];
+
+            // Preload voiceprints enrolled via intro so we can recognize speakers.
+            $enrolledVoiceprints = $this->loadEnrolledVoiceprints($meetingId);
 
             if (!$isIntroMode) {
                 foreach ($users as $label => $seconds) {
@@ -488,59 +527,126 @@ class ProcessChunkJob implements ShouldQueue
                 }
             }
 
-            // FIX #4: Enrollment (name detection) is scoped per chunk label.
-            // Each chunk gets its own speaker_0, speaker_1 etc. so names never collide.
-            foreach ($speakerText as $label => $text) {
-                $label = (string) $label;
-                $realName = $this->extractNameFromText((string) $text);
-                if (!$realName) {
-                    continue;
-                }
+            // Intro-only: enroll participants (name + voiceprint) and persist the mapping.
+            // In meeting mode we must NOT enroll/rename based on "my name is ...".
+            if ($isIntroMode) {
+                // FIX #4: Enrollment (name detection) is scoped per chunk label.
+                // Each chunk gets its own speaker_0, speaker_1 etc. so names never collide.
+                foreach ($speakerText as $label => $text) {
+                    $label = (string) $label;
+                    $realName = $this->extractNameFromText((string) $text);
+                    if (!$realName) {
+                        continue;
+                    }
 
-                $enrolledEmbedding = [
-                    'provider' => 'deepgram',
-                    'type' => 'intro_name_enrollment',
-                    'speaker_label' => $label,
-                    'enrolled_name' => $realName,
-                    'enrolled_at' => now()->toISOString(),
-                ];
-
-                // Find or create participant by real name.
-                $named = MeetingParticipant::query()
-                    ->where('meeting_id', $meetingId)
-                    ->whereRaw('LOWER(name) = ?', [strtolower($realName)])
-                    ->first();
-
-                if (!$named) {
-                    $named = MeetingParticipant::create([
-                        'meeting_id' => $meetingId,
-                        'user_id' => null,
-                        'name' => $realName,
-                        'voice_embedding' => $enrolledEmbedding,
-                    ]);
-                } else {
-                    $named->update([
-                        'voice_embedding' => array_merge(
-                            is_array($named->voice_embedding) ? $named->voice_embedding : [],
-                            $enrolledEmbedding,
-                        ),
-                    ]);
-                }
-
-                // Map THIS chunk's scoped label to the named participant.
-                // Because label is "chunk1_speaker_0", it won't collide with "chunk0_speaker_0".
-                $mapping = SpeakerMapping::updateOrCreate(
-                    [
-                        'meeting_id' => $meetingId,
+                    $enrolledEmbedding = [
+                        'provider' => 'deepgram',
+                        'type' => 'intro_name_enrollment',
                         'speaker_label' => $label,
-                    ],
-                    [
-                        'participant_id' => $named->id,
-                        'confidence' => null,
-                    ]
-                );
+                        'enrolled_name' => $realName,
+                        'enrolled_at' => now()->toISOString(),
+                    ];
 
-                $labelToParticipantId[$label] = (int) $mapping->participant_id;
+                    // Attach voiceprint if available for this label.
+                    $vec = $speakerEmbeddings[$label] ?? null;
+                    if (is_array($vec) && count($vec) > 0) {
+                        $enrolledEmbedding['voiceprint'] = $vec;
+                        $enrolledEmbedding['voiceprint_dim'] = count($vec);
+                    } elseif (is_array($globalEmbedding) && count($globalEmbedding) > 0) {
+                        // Fast path: analyzer already computed a global embedding for intro clips.
+                        $enrolledEmbedding['voiceprint'] = array_map('floatval', $globalEmbedding);
+                        $enrolledEmbedding['voiceprint_dim'] = count($enrolledEmbedding['voiceprint']);
+                    } elseif ($this->filePath) {
+                        // Fallback: always store a voiceprint during intro enrollment.
+                        // Analyzer might skip global_embedding if SpeechBrain isn't available or hasn't warmed up yet.
+                        $computed = $this->computeVoiceprint(Storage::path($this->filePath));
+                        if (is_array($computed) && count($computed) > 0) {
+                            $enrolledEmbedding['voiceprint'] = $computed;
+                            $enrolledEmbedding['voiceprint_dim'] = count($computed);
+                        }
+                    }
+
+                    // Find or create participant by real name.
+                    $named = MeetingParticipant::query()
+                        ->where('meeting_id', $meetingId)
+                        ->whereRaw('LOWER(name) = ?', [strtolower($realName)])
+                        ->first();
+
+                    if (!$named) {
+                        $named = MeetingParticipant::create([
+                            'meeting_id' => $meetingId,
+                            'user_id' => null,
+                            'name' => $realName,
+                            'voice_embedding' => $enrolledEmbedding,
+                        ]);
+                    } else {
+                        $named->update([
+                            'voice_embedding' => array_merge(
+                                is_array($named->voice_embedding) ? $named->voice_embedding : [],
+                                $enrolledEmbedding,
+                            ),
+                        ]);
+                    }
+
+                    // Map THIS chunk's scoped label to the named participant.
+                    $mapping = SpeakerMapping::updateOrCreate(
+                        [
+                            'meeting_id' => $meetingId,
+                            'speaker_label' => $label,
+                        ],
+                        [
+                            'participant_id' => $named->id,
+                            'confidence' => null,
+                        ]
+                    );
+
+                    $labelToParticipantId[$label] = (int) $mapping->participant_id;
+                }
+            }
+
+            // Voice recognition in meeting mode: match each label embedding to enrolled voiceprints,
+            // and redirect SpeakerMappings away from placeholders when confident.
+            if (!$isIntroMode && count($enrolledVoiceprints) > 0 && count($speakerEmbeddings) > 0) {
+                foreach ($speakerEmbeddings as $label => $vec) {
+                    if (!is_string($label) || !is_array($vec) || count($vec) === 0) {
+                        continue;
+                    }
+                    $pid = $labelToParticipantId[$label] ?? null;
+                    if (!$pid) {
+                        continue;
+                    }
+
+                    $match = $this->matchVoiceprint($vec, $enrolledVoiceprints);
+                    if (!$match) {
+                        continue;
+                    }
+
+                    [$matchedParticipantId, $score] = $match;
+
+                    // Redirect mapping to the matched participant.
+                    if ((int) $matchedParticipantId !== (int) $pid) {
+                        SpeakerMapping::query()
+                            ->where('meeting_id', $meetingId)
+                            ->where('speaker_label', $label)
+                            ->update([
+                                'participant_id' => (int) $matchedParticipantId,
+                                'confidence' => $score,
+                            ]);
+
+                        // Delete placeholder participant if it's only a generated speaker label.
+                        $participant = MeetingParticipant::query()->whereKey($pid)->first();
+                        if ($participant) {
+                            $isPlaceholder = preg_match('/^Speaker\s+\d+$/i', (string) $participant->name) === 1
+                                || preg_match('/^chunk\d+_speaker_\d+$/i', (string) $participant->name) === 1
+                                || preg_match('/^chunk\d+_speaker_unknown$/i', (string) $participant->name) === 1;
+                            if ($isPlaceholder) {
+                                $participant->delete();
+                            }
+                        }
+
+                        $labelToParticipantId[$label] = (int) $matchedParticipantId;
+                    }
+                }
             }
 
             if (!$isIntroMode) {
@@ -587,6 +693,134 @@ class ProcessChunkJob implements ShouldQueue
                 );
             }
         });
+    }
+
+    /**
+     * Compute a normalized voiceprint embedding for an audio file.
+     *
+     * @return array<int,float>|null
+     */
+    private function computeVoiceprint(string $absolutePath): ?array
+    {
+        $python = (string) config('meeting_analytics.analyzer.python', 'python3');
+        $script = base_path('scripts/embed_audio.py');
+        $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
+
+        $process = new Process([
+            $python,
+            $script,
+            '--file',
+            $absolutePath,
+            '--timeout',
+            (string) $timeout,
+            '--max-seconds',
+            (string) ($this->durationSeconds ?? 0),
+        ]);
+        $process->setTimeout($timeout + 20);
+        $process->setEnv(array_merge($_SERVER, $_ENV, [
+            'PATH' => $this->buildPath(),
+        ]));
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        $decoded = json_decode((string) $process->getOutput(), true);
+        if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
+            return null;
+        }
+
+        $vec = [];
+        foreach ($decoded['embedding'] as $v) {
+            if (is_numeric($v)) {
+                $vec[] = (float) $v;
+            }
+        }
+        return count($vec) > 0 ? $vec : null;
+    }
+
+    /**
+     * @return array<int,array{participant_id:int,vector:array<int,float>}>
+     */
+    private function loadEnrolledVoiceprints(int $meetingId): array
+    {
+        $rows = MeetingParticipant::query()
+            ->where('meeting_id', $meetingId)
+            ->whereNotNull('voice_embedding')
+            ->get(['id', 'voice_embedding']);
+
+        $out = [];
+        foreach ($rows as $p) {
+            $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
+            $vec = $ve['voiceprint'] ?? null;
+            if (!is_array($vec) || count($vec) < 32) {
+                continue;
+            }
+            $floats = [];
+            foreach ($vec as $v) {
+                if (is_numeric($v)) {
+                    $floats[] = (float) $v;
+                }
+            }
+            if (count($floats) < 32) {
+                continue;
+            }
+            $out[] = [
+                'participant_id' => (int) $p->id,
+                'vector' => $floats,
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * @param array<int,float> $a
+     * @param array<int,float> $b
+     */
+    private function cosineSimilarity(array $a, array $b): float
+    {
+        $n = min(count($a), count($b));
+        if ($n === 0) {
+            return 0.0;
+        }
+        $dot = 0.0;
+        $na = 0.0;
+        $nb = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            $av = (float) $a[$i];
+            $bv = (float) $b[$i];
+            $dot += $av * $bv;
+            $na += $av * $av;
+            $nb += $bv * $bv;
+        }
+        if ($na <= 0.0 || $nb <= 0.0) {
+            return 0.0;
+        }
+        return $dot / (sqrt($na) * sqrt($nb));
+    }
+
+    /**
+     * @param array<int,float> $vec
+     * @param array<int,array{participant_id:int,vector:array<int,float>}> $enrolled
+     * @return array{0:int,1:float}|null
+     */
+    private function matchVoiceprint(array $vec, array $enrolled): ?array
+    {
+        $threshold = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
+        $bestId = null;
+        $bestScore = -1.0;
+        foreach ($enrolled as $e) {
+            $score = $this->cosineSimilarity($vec, $e['vector']);
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestId = (int) $e['participant_id'];
+            }
+        }
+        if ($bestId === null || $bestScore < $threshold) {
+            return null;
+        }
+        return [$bestId, $bestScore];
     }
 
     private function persistTranscriptToDatabase(int $meetingId, array $analysis): void

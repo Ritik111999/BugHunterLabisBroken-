@@ -219,6 +219,13 @@
             <div id="bars" class="space-y-3">
                 <div class="text-xs text-slate-400">Waiting for speech…</div>
             </div>
+            <div class="border-t pt-3">
+                <div class="flex items-center justify-between">
+                    <div class="font-semibold text-sm">Voice matching (debug)</div>
+                    <div id="voiceConfig" class="text-xs text-slate-500 font-mono">–</div>
+                </div>
+                <div id="voiceMatching" class="mt-2 text-xs text-slate-600 font-mono whitespace-pre-wrap">–</div>
+            </div>
         </div>
 
         <!-- Live transcript -->
@@ -269,9 +276,11 @@ const state = {
     meeting: {
         running: false, paused: false, chunkIndex: 0, startedAt: null, timer: null,
         stream: null, recorder: null,
+        audioCtx: null,
     },
     ws: { socket: null, connected: false },
     sse: null,
+    audio: { lastSentAt: 0, keepaliveTimer: null },
 };
 
 // ─────────────────────────── Persist ───────────────────────────
@@ -536,16 +545,25 @@ async function enrollOneParticipant() {
     state.introEnrolling = true;
     introUi('recording');
 
-    const seconds = Math.max(3, Math.min(15, parseInt($('introSeconds').value, 10) || 6));
+    // Enrollment must be quick on mobile; user chooses duration.
+    // We enforce min/max in the UI so backend can embed the same window.
+    const seconds = Math.max(3, Math.min(6, parseInt($('introSeconds').value, 10) || 6));
     logIntro(`▶ Recording ${seconds}s — say: "My name is [name]"`);
 
-    const stream  = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const beforeNames = new Set(state.participants.filter(p => !isPlaceholder(p.name)).map(p => p.name.toLowerCase()));
+
+    // Ask browser to apply common voice-processing so enrollment doesn't require shouting.
+    const stream  = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+        }
+    });
     const mime    = MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
         ? 'audio/ogg;codecs=opus'
         : MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
             ? 'audio/webm;codecs=opus' : 'audio/webm';
-
-    const beforeNames = new Set(state.participants.filter(p => !isPlaceholder(p.name)).map(p => p.name.toLowerCase()));
 
     const recorder = new MediaRecorder(stream, { mimeType: mime });
     const parts = [];
@@ -562,15 +580,23 @@ async function enrollOneParticipant() {
 
     const fd = new FormData();
     fd.append('chunk_index', String(state.introChunkIndex++));
+    fd.append('duration_seconds', String(seconds));
     fd.append('audio', blob, `intro.${ext}`);
 
-    const res = await api(`/api/meetings/${state.meetingId}/intro/chunk?sync=1`, { method: 'POST', body: fd });
-    logIntro(`✓ Server responded: status=${res?.status}`);
+    // Queue intro processing so the upload returns fast, then poll until the participant appears.
+    const res = await api(`/api/meetings/${state.meetingId}/intro/chunk?sync=0`, { method: 'POST', body: fd });
+    logIntro(`✓ Uploaded: status=${res?.status || 'ok'} (processing in background)`);
 
     if (res?.status === 'failed') throw new Error(String(res.error || 'analyzer_failed'));
 
-    await refreshParticipants();
-    const newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
+    const deadline = Date.now() + 30000; // 30s max wait
+    let newNames = [];
+    while (Date.now() < deadline) {
+        await refreshParticipants();
+        newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
+        if (newNames.length > 0) break;
+        await sleep(1000);
+    }
 
     state.introEnrolling = false;
     if (newNames.length > 0) {
@@ -578,7 +604,7 @@ async function enrollOneParticipant() {
         logIntro(`✅ Enrolled: ${newNames.map(p => p.name).join(', ')}`);
         introUi('done');
     } else {
-        logIntro('⚠ No name detected — please try again, say your name clearly.');
+        logIntro('⚠ Still processing or no name detected yet — please wait a bit or try again.');
         introUi('retry');
     }
 }
@@ -650,7 +676,8 @@ $('btnStartMeeting').addEventListener('click', async () => {
 function startWs() {
     const token  = state.token;
     const base   = $('relayWsUrl').value.trim().replace(/\/$/, '');
-    const wsUrl  = `${base}/meetings/${state.meetingId}/live?token=${encodeURIComponent(token)}`;
+    // Chrome test mode: stream raw PCM16 (16kHz mono) to avoid WebM/Opus chunk issues.
+    const wsUrl  = `${base}/meetings/${state.meetingId}/live?token=${encodeURIComponent(token)}&format=pcm16`;
     const ws     = new WebSocket(wsUrl);
     state.ws.socket = ws;
 
@@ -661,45 +688,134 @@ function startWs() {
         state.ws.connected = true;
         logEvent('WS connected ✓');
         $('wsStatusBadge').textContent = 'WS: connected ✓';
+
+        // Keepalive: send silence periodically if audio pipeline stalls.
+        if (state.audio.keepaliveTimer) clearInterval(state.audio.keepaliveTimer);
+        state.audio.lastSentAt = Date.now();
+        state.audio.keepaliveTimer = setInterval(() => {
+            if (!state.meeting.running) return;
+            if (ws.readyState !== WebSocket.OPEN) return;
+            const since = Date.now() - (state.audio.lastSentAt || 0);
+            if (since < 2000) return; // audio is flowing
+            // Send 100ms of silence PCM16 @ 16kHz mono (1600 samples = 3200 bytes)
+            try {
+                ws.send(new ArrayBuffer(3200));
+                state.audio.lastSentAt = Date.now();
+            } catch {}
+        }, 1000);
     };
-    ws.onerror = () => { logEvent('WS error'); $('wsStatusBadge').textContent = 'WS: error ✗'; };
-    ws.onclose = () => {
+    ws.onerror = (ev) => {
+        logEvent('WS error (see console for details)');
+        $('wsStatusBadge').textContent = 'WS: error ✗';
+        try { console.error('WS error event', ev); } catch {}
+    };
+    ws.onclose = (ev) => {
         state.ws.connected = false;
-        logEvent('WS closed');
+        const code = (ev && typeof ev.code === 'number') ? ev.code : 'n/a';
+        const reason = (ev && typeof ev.reason === 'string') ? ev.reason : '';
+        const clean = (ev && typeof ev.wasClean === 'boolean') ? ev.wasClean : false;
+        logEvent(`WS closed (code=${code} clean=${clean} reason=${reason})`);
         $('wsStatusBadge').textContent = 'WS: closed';
     };
     ws.onmessage = ev => {
         try {
             const msg = JSON.parse(String(ev.data || ''));
             if (msg?.error) { logEvent(`WS error: ${msg.error}${msg.message ? ' – ' + msg.message : ''}`); return; }
-            if (msg?.event === 'stats.updated')      renderBars(msg.data);
+            if (msg?.event === 'stats.updated')      { renderBars(msg.data); renderVoiceDebug(msg.data); }
             if (msg?.event === 'transcript.updated') renderLiveLines(msg.data?.lines || []);
         } catch {}
     };
 
-    // Stream mic audio
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        state.meeting.stream = stream;
-        const mime = MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
-            ? 'audio/ogg;codecs=opus'
-            : MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                ? 'audio/webm;codecs=opus' : 'audio/webm';
+    startWsPcm(ws).catch(e => logEvent('Mic PCM error: ' + e.message));
+}
 
-        const recorder = new MediaRecorder(stream, { mimeType: mime });
-        state.meeting.recorder = recorder;
-        recorder.ondataavailable = async ev => {
-            if (!state.meeting.running || state.meeting.paused) return;
-            if (!ev.data || ev.data.size === 0) return;
-            if (ws.readyState !== WebSocket.OPEN) return;
-            try { ws.send(await ev.data.arrayBuffer()); } catch {}
-        };
-        recorder.start(250);
-        logEvent(`Mic streaming started (${mime}) via WebSocket`);
-
-        if (state.introMode === 'ws') {
-            logEvent('🎤 Intro mode: each participant say "My name is [name]" now, then continue normally.');
+async function startWsPcm(ws) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
         }
-    }).catch(e => logEvent('Mic error: ' + e.message));
+    });
+    state.meeting.stream = stream;
+
+    if (!window.AudioWorkletNode) {
+        throw new Error('AudioWorklet not supported in this browser');
+    }
+
+    // Force 16kHz AudioContext in Chrome to avoid resampling drift/quality loss.
+    const AudioCtx = (window.AudioContext || window.webkitAudioContext);
+    const ctx = new AudioCtx({ sampleRate: 16000 });
+    state.meeting.audioCtx = ctx;
+
+    // Worklet: just forwards Float32 frames; conversion/resample happens on main thread.
+    const workletCode = `
+        class WcPcmTap extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0];
+            const ch0 = input && input[0];
+            if (ch0 && ch0.length) {
+              // Copy because underlying buffer is reused by AudioWorklet.
+              this.port.postMessage(ch0.slice(0));
+            }
+            return true;
+          }
+        }
+        registerProcessor('wc-pcm-tap', WcPcmTap);
+    `;
+    const blobUrl = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+    await ctx.audioWorklet.addModule(blobUrl);
+    URL.revokeObjectURL(blobUrl);
+
+    const source = ctx.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(ctx, 'wc-pcm-tap');
+    // Avoid feedback: do not connect to destination.
+    source.connect(node);
+
+    function floatToPcm16LE(f32) {
+        const out = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+            const x = Math.max(-1, Math.min(1, f32[i]));
+            out[i] = x < 0 ? (x * 0x8000) : (x * 0x7FFF);
+        }
+        return out.buffer;
+    }
+
+    node.port.onmessage = (ev) => {
+        // IMPORTANT: keep the WS + Deepgram connection alive even during silence/paused.
+        // If paused, we send silence frames instead of stopping audio entirely.
+        if (!state.meeting.running) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
+
+        const chunk = ev.data;
+        if (!(chunk instanceof Float32Array) || chunk.length === 0) return;
+
+        // AudioContext is fixed at 16kHz, so just frame to ~100ms.
+        // Keep a small remainder buffer for clean framing.
+        const frameSamples = 1600; // 100ms @ 16k
+        if (!startWsPcm._buf) startWsPcm._buf = new Float32Array(0);
+        const prev = startWsPcm._buf;
+        const src = new Float32Array(prev.length + chunk.length);
+        src.set(prev, 0);
+        src.set(chunk, prev.length);
+
+        let offset = 0;
+        while (offset + frameSamples <= src.length) {
+            const frame = src.subarray(offset, offset + frameSamples);
+            const toSend = state.meeting.paused ? new Float32Array(frameSamples) : frame;
+            try {
+                ws.send(floatToPcm16LE(toSend));
+                state.audio.lastSentAt = Date.now();
+            } catch {}
+            offset += frameSamples;
+        }
+        startWsPcm._buf = src.subarray(offset);
+    };
+
+    logEvent('Mic streaming started (PCM16 16k mono) via WebSocket');
+    if (state.introMode === 'ws') {
+        logEvent('🎤 Intro mode: each participant say "My name is [name]" now, then continue normally.');
+    }
 }
 
 // ─────────────────────────── HTTP chunk meeting ───────────────────────────
@@ -775,24 +891,79 @@ function renderBars(payload) {
     const bars  = $('bars');
     const parts = payload?.participants || [];
     if (parts.length === 0) return;
-    bars.innerHTML = '';
+    // Keep DOM nodes stable so the width transition animates smoothly.
+    if (!renderBars._els) renderBars._els = new Map();
+
     const sorted = [...parts].sort((a, b) => (b.talk_percentage || 0) - (a.talk_percentage || 0));
+    const seen = new Set();
+
     sorted.forEach(p => {
+        const pid = Number(p.participant_id || 0);
+        const key = pid > 0 ? `pid:${pid}` : `label:${String(p.label || p.name || '')}`;
+        seen.add(key);
+
         const pct = Math.max(0, Math.min(100, Number(p.talk_percentage || 0)));
-        const el  = document.createElement('div');
-        el.className = 'space-y-1';
-        el.innerHTML = `
-            <div class="flex items-center justify-between text-sm">
-                <span class="font-medium">${p.name}</span>
-                <span class="text-slate-500 tabular-nums">${pct.toFixed(0)}% · ${p.talk_time ?? 0}s</span>
-            </div>
-            <div class="h-2.5 rounded-full bg-slate-100 overflow-hidden">
-                <div class="h-2.5 rounded-full bg-blue-500 transition-all" style="width:${pct}%"></div>
-            </div>
-        `;
-        bars.appendChild(el);
+        const secs = (p.talk_time_seconds != null) ? Number(p.talk_time_seconds) : Number(p.talk_time || 0);
+
+        let el = renderBars._els.get(key);
+        if (!el) {
+            el  = document.createElement('div');
+            el.className = 'space-y-1';
+            el.innerHTML = `
+                <div class="flex items-center justify-between text-sm">
+                    <span class="font-medium js-name"></span>
+                    <span class="text-slate-500 tabular-nums js-meta"></span>
+                </div>
+                <div class="h-2.5 rounded-full bg-slate-100 overflow-hidden">
+                    <div class="h-2.5 rounded-full bg-blue-500 transition-[width] duration-150 ease-linear js-bar" style="width:0%"></div>
+                </div>
+            `;
+            renderBars._els.set(key, el);
+            bars.appendChild(el);
+        } else {
+            // Reorder to match sorted order.
+            bars.appendChild(el);
+        }
+
+        el.querySelector('.js-name').textContent = String(p.name || 'Unknown');
+        el.querySelector('.js-meta').textContent = `${pct.toFixed(0)}% · ${secs.toFixed(1)}s`;
+        el.querySelector('.js-bar').style.width = `${pct}%`;
     });
+
+    // Remove bars that no longer exist.
+    for (const [key, el] of renderBars._els.entries()) {
+        if (!seen.has(key)) {
+            try { el.remove(); } catch {}
+            renderBars._els.delete(key);
+        }
+    }
     $('crosstalkPct').textContent = String(Math.round(payload?.crosstalk_percentage || 0));
+}
+
+function renderVoiceDebug(payload) {
+    const cfg = payload?.voice_config || null;
+    const matching = payload?.voice_matching || null;
+    if (!cfg || !matching) return;
+
+    $('voiceConfig').textContent =
+        `format=${cfg.format} thr=${Number(cfg.threshold).toFixed(2)} early=${Number(cfg.early_boost).toFixed(2)} win=${cfg.label_window_seconds}s min=${cfg.label_min_speech_seconds}s`;
+
+    const labels = Object.keys(matching || {});
+    if (labels.length === 0) {
+        $('voiceMatching').textContent = 'No labels yet.';
+        return;
+    }
+
+    const lines = labels.sort().map(l => {
+        const m = matching[l] || {};
+        const score = Number(m.best_score || 0).toFixed(3);
+        const thr = Number(m.threshold || 0).toFixed(3);
+        const ev = Number(m.evidence_count || 0);
+        const name = m.best_participant_name || '';
+        const ok = m.matched ? 'MATCH' : 'no';
+        return `${l}: score=${score} thr=${thr} evidence=${ev} best=${name} => ${ok}`;
+    });
+    $('voiceMatching').textContent = lines.join('\n');
 }
 
 function renderLiveLines(lines) {
@@ -859,11 +1030,15 @@ function stopMic() {
     state.meeting.running = false;
     try { state.meeting.recorder?.stop(); } catch {}
     try { state.meeting.stream?.getTracks().forEach(t => t.stop()); } catch {}
+    try { state.meeting.audioCtx?.close(); } catch {}
     try { state.ws.socket?.close(); } catch {}
+    try { if (state.audio.keepaliveTimer) clearInterval(state.audio.keepaliveTimer); } catch {}
+    state.audio.keepaliveTimer = null;
     state.ws.socket    = null;
     state.ws.connected = false;
     state.meeting.recorder = null;
     state.meeting.stream   = null;
+    state.meeting.audioCtx = null;
 }
 
 // ─────────────────────────── Analytics ───────────────────────────
