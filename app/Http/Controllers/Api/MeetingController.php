@@ -10,7 +10,16 @@ class MeetingController extends Controller
 {
 public function index()
 {
-    $meetings = Meeting::where('host_id', auth()->id())
+    $user = auth()->user();
+    $plan = $user?->currentPlan();
+    $days = $plan?->meeting_history_days;
+
+    $q = Meeting::where('host_id', auth()->id());
+    if (is_numeric($days)) {
+        $q->where('created_at', '>=', now()->subDays((int) $days));
+    }
+
+    $meetings = $q
         ->withCount('participants')
         ->latest()
         ->get()

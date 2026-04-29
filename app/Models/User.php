@@ -11,6 +11,8 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
+use App\Models\UserSubscription;
+use App\Models\SubscriptionPlan;
 
 #[Fillable(['name', 'email', 'password'])]
 #[Hidden(['password', 'remember_token'])]
@@ -49,5 +51,27 @@ class User extends Authenticatable
 public function meetingParticipants()
 {
     return $this->hasMany(MeetingParticipant::class);
+}
+
+public function subscriptions()
+{
+    return $this->hasMany(UserSubscription::class);
+}
+
+public function activeSubscription()
+{
+    return $this->hasOne(UserSubscription::class)
+        ->where('status', 'active')
+        ->where('expires_at', '>', now())
+        ->orderByDesc('expires_at');
+}
+
+public function currentPlan(): ?SubscriptionPlan
+{
+    $sub = $this->activeSubscription()->with('plan')->first();
+    if ($sub && $sub->plan) {
+        return $sub->plan;
+    }
+    return SubscriptionPlan::query()->where('code', 'basic')->first();
 }
 }

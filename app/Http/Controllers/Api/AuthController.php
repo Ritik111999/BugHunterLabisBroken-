@@ -7,6 +7,7 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
+use App\Models\UserSubscription;
 
 class AuthController extends Controller
 {
@@ -47,12 +48,15 @@ class AuthController extends Controller
         ]);
 
         $token = $user->createToken('auth_token')->plainTextToken;
+        $sub = $user->activeSubscription()->with('plan')->first();
+        $plan = $user->currentPlan();
 
         return response()->json([
             'status'  => 'success',
             'message' => 'User registered successfully',
             'data'    => array_merge($user->toArray(), [
                 'token' => $token,
+                'subscription' => $this->subscriptionPayload($sub, $plan),
             ]),
         ]);
     }
@@ -93,12 +97,15 @@ class AuthController extends Controller
         }
 
         $token = $user->createToken('auth_token')->plainTextToken;
+        $sub = $user->activeSubscription()->with('plan')->first();
+        $plan = $user->currentPlan();
 
         return response()->json([
             'status'  => 'success',
             'message' => 'Login successful',
             'data'    => array_merge($user->toArray(), [
                 'token' => $token,
+                'subscription' => $this->subscriptionPayload($sub, $plan),
             ]),
         ]);
     }
@@ -121,5 +128,34 @@ class AuthController extends Controller
             'status' => 'success',
             'message' => 'Logged out successfully',
         ]);
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function subscriptionPayload(?UserSubscription $sub, $plan): array
+    {
+        $isPremium = $sub !== null;
+
+        return [
+            'is_premium' => $isPremium,
+            'expires_at' => $sub?->expires_at?->toISOString(),
+            'platform' => $sub?->platform,
+            'product_id' => $sub?->product_id,
+            'plan' => $plan ? [
+                'id' => (int) $plan->id,
+                'code' => (string) $plan->code,
+                'name' => (string) $plan->name,
+                'price_usd' => (float) $plan->price_usd,
+                'currency' => (string) $plan->currency,
+                'billing_cycle' => (string) $plan->billing_cycle,
+                'max_participants_per_meeting' => $plan->max_participants_per_meeting,
+                'meeting_history_days' => $plan->meeting_history_days,
+                'advanced_analytics' => (bool) $plan->advanced_analytics,
+                'transcript_search' => (bool) $plan->transcript_search,
+                'export_reports' => (bool) $plan->export_reports,
+                'trial_days' => (int) $plan->trial_days,
+            ] : null,
+        ];
     }
 }

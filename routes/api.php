@@ -17,6 +17,8 @@ use App\Http\Controllers\Api\MeetingStatsController;
 use App\Http\Controllers\Api\SpeakerMappingController;
 use App\Http\Controllers\Api\TranscriptController;
 use App\Http\Controllers\Api\IntroChunkController;
+use App\Http\Controllers\Api\InAppPurchaseController;
+use App\Http\Controllers\Api\SubscriptionPlanController;
 
 use Illuminate\Support\Facades\Route;
 
@@ -38,6 +40,7 @@ Route::post('/reset-password', [ForgotPasswordController::class, 'resetPassword'
 // Static Pages (Public)
 Route::get('/pages/{type}', [PageController::class, 'show']);
 Route::get('/faqs', [FaqController::class, 'index']);
+Route::get('/subscription-plans', [SubscriptionPlanController::class, 'index']);
 
 
 /*
@@ -130,5 +133,14 @@ Route::middleware('api.auth')->group(function () {
     Route::get('/meetings/{id}/speakers', [SpeakerMappingController::class, 'list']);
     Route::post('/meetings/{id}/speakers/map', [SpeakerMappingController::class, 'map']);
     Route::get('/meetings/{id}/transcripts', [TranscriptController::class, 'list']);
+
+    /*
+    |--------------------------------------------------------------------------
+    | In-App Purchase (Subscription)
+    |--------------------------------------------------------------------------
+    */
+    Route::post('/iap/subscription/activate', [InAppPurchaseController::class, 'activate']);
+    Route::post('/iap/subscription/restore', [InAppPurchaseController::class, 'restore']);
+    Route::get('/iap/subscription/status', [InAppPurchaseController::class, 'status']);
 
 });
