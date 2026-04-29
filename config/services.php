@@ -40,6 +40,15 @@ return [
         'live_model' => env('DEEPGRAM_LIVE_MODEL', 'nova-3'),
     ],
 
+    /*
+    | Smallest AI Waves — Pulse STT (WebSocket + HTTP get_text).
+    | MEETING_STT_PROVIDER=pulse uses PULSE_API_KEY for live relay + batch analyzer.
+    */
+    'pulse' => [
+        'api_key' => env('PULSE_API_KEY'),
+        'language' => env('PULSE_LANGUAGE', 'en'),
+    ],
+
     'python' => [
         'bin' => env('PYTHON_BIN'),
     ],

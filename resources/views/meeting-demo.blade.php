@@ -583,19 +583,20 @@ async function enrollOneParticipant() {
     fd.append('duration_seconds', String(seconds));
     fd.append('audio', blob, `intro.${ext}`);
 
-    // Queue intro processing so the upload returns fast, then poll until the participant appears.
-    const res = await api(`/api/meetings/${state.meetingId}/intro/chunk?sync=0`, { method: 'POST', body: fd });
-    logIntro(`✓ Uploaded: status=${res?.status || 'ok'} (processing in background)`);
+    // sync=1 runs Deepgram+analyzer in the HTTP request (no queue worker needed for local demos).
+    const res = await api(`/api/meetings/${state.meetingId}/intro/chunk?sync=1`, { method: 'POST', body: fd });
+    logIntro(`✓ Processed: status=${res?.status || 'ok'}`);
 
     if (res?.status === 'failed') throw new Error(String(res.error || 'analyzer_failed'));
 
-    const deadline = Date.now() + 30000; // 30s max wait
     let newNames = [];
-    while (Date.now() < deadline) {
+    await refreshParticipants();
+    newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
+    // One short retry in case the list endpoint reads slightly stale.
+    if (newNames.length === 0) {
+        await sleep(400);
         await refreshParticipants();
         newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
-        if (newNames.length > 0) break;
-        await sleep(1000);
     }
 
     state.introEnrolling = false;
@@ -663,7 +664,8 @@ $('btnStartMeeting').addEventListener('click', async () => {
         const useWs = $('useWs').checked;
         if (useWs) {
             startWs();
-            $('transcriptMode').textContent = 'Live (WebSocket → Deepgram)';
+            $('transcriptMode').textContent = 'Bars only (WebSocket realtime)';
+            $('liveTranscript').innerHTML = '<div class="text-xs text-slate-400">Live transcript disabled for ultra-low latency mode.</div>';
         } else {
             startHttpChunks();
             startSse();
@@ -677,7 +679,7 @@ function startWs() {
     const token  = state.token;
     const base   = $('relayWsUrl').value.trim().replace(/\/$/, '');
     // Chrome test mode: stream raw PCM16 (16kHz mono) to avoid WebM/Opus chunk issues.
-    const wsUrl  = `${base}/meetings/${state.meetingId}/live?token=${encodeURIComponent(token)}&format=pcm16`;
+    const wsUrl  = `${base}/meetings/${state.meetingId}/live?token=${encodeURIComponent(token)}&format=pcm16&transcript=0`;
     const ws     = new WebSocket(wsUrl);
     state.ws.socket = ws;
 
@@ -790,9 +792,9 @@ async function startWsPcm(ws) {
         const chunk = ev.data;
         if (!(chunk instanceof Float32Array) || chunk.length === 0) return;
 
-        // AudioContext is fixed at 16kHz, so just frame to ~100ms.
+        // AudioContext is fixed at 16kHz, so frame to ~40ms for lower latency.
         // Keep a small remainder buffer for clean framing.
-        const frameSamples = 1600; // 100ms @ 16k
+        const frameSamples = 640; // 40ms @ 16k
         if (!startWsPcm._buf) startWsPcm._buf = new Float32Array(0);
         const prev = startWsPcm._buf;
         const src = new Float32Array(prev.length + chunk.length);
@@ -896,14 +898,16 @@ function renderBars(payload) {
 
     const sorted = [...parts].sort((a, b) => (b.talk_percentage || 0) - (a.talk_percentage || 0));
     const seen = new Set();
+    const meetingSeconds = Math.max(0.001, Number(payload?.live_audio_seconds || 0));
 
     sorted.forEach(p => {
         const pid = Number(p.participant_id || 0);
         const key = pid > 0 ? `pid:${pid}` : `label:${String(p.label || p.name || '')}`;
         seen.add(key);
 
-        const pct = Math.max(0, Math.min(100, Number(p.talk_percentage || 0)));
         const secs = (p.talk_time_seconds != null) ? Number(p.talk_time_seconds) : Number(p.talk_time || 0);
+        // For bars-only live mode, show "% of meeting time spoken" (not only % of spoken share).
+        const pctMeeting = Math.max(0, Math.min(100, (secs / meetingSeconds) * 100));
 
         let el = renderBars._els.get(key);
         if (!el) {
@@ -926,8 +930,8 @@ function renderBars(payload) {
         }
 
         el.querySelector('.js-name').textContent = String(p.name || 'Unknown');
-        el.querySelector('.js-meta').textContent = `${pct.toFixed(0)}% · ${secs.toFixed(1)}s`;
-        el.querySelector('.js-bar').style.width = `${pct}%`;
+        el.querySelector('.js-meta').textContent = `${pctMeeting.toFixed(0)}% · ${secs.toFixed(1)}s`;
+        el.querySelector('.js-bar').style.width = `${pctMeeting}%`;
     });
 
     // Remove bars that no longer exist.
@@ -969,18 +973,45 @@ function renderVoiceDebug(payload) {
 function renderLiveLines(lines) {
     const wrap = $('liveTranscript');
     if (!Array.isArray(lines) || lines.length === 0) return;
-    wrap.innerHTML = '';
+
+    if (!renderLiveLines._els) renderLiveLines._els = new Map();
+
+    const seen = new Set();
     lines.filter(x => String(x.text || '').trim()).forEach(x => {
-        const el = document.createElement('div');
-        el.className = 'flex gap-2 text-sm';
+        const label = String(x.label || '');
+        const key = label !== '' ? label : String(x.name || x.label || '');
+
+        seen.add(key);
+        let el = renderLiveLines._els.get(key);
+        if (!el) {
+            el = document.createElement('div');
+            el.className = 'flex gap-2 text-sm';
+            el.dataset.liveKey = key;
+            el.innerHTML = `
+                <span class="js-name whitespace-nowrap min-w-[80px] text-right"></span>
+                <span class="js-text text-slate-700"></span>
+            `;
+            renderLiveLines._els.set(key, el);
+            wrap.appendChild(el);
+        } else {
+            wrap.appendChild(el);
+        }
+
         const nameColor = isPlaceholder(x.name || x.label)
             ? 'text-slate-400' : 'text-blue-700 font-semibold';
-        el.innerHTML = `
-            <span class="${nameColor} whitespace-nowrap min-w-[80px] text-right">${x.name || x.label}</span>
-            <span class="text-slate-700">${x.text}</span>
-        `;
-        wrap.appendChild(el);
+        const nameEl = el.querySelector('.js-name');
+        const textEl = el.querySelector('.js-text');
+        nameEl.className = `js-name whitespace-nowrap min-w-[80px] text-right ${nameColor}`;
+        nameEl.textContent = x.name || x.label;
+        textEl.textContent = x.text;
     });
+
+    for (const [key, el] of renderLiveLines._els.entries()) {
+        if (!seen.has(key)) {
+            try { el.remove(); } catch {}
+            renderLiveLines._els.delete(key);
+        }
+    }
 }
 
 function logEvent(line) {

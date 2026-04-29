@@ -139,14 +139,21 @@ class ProcessChunkJob implements ShouldQueue
         $python = (string) config('meeting_analytics.analyzer.python', 'python3');
         $script = (string) config('meeting_analytics.analyzer.script');
         $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
+        $sttProvider = strtolower(trim((string) env('MEETING_STT_PROVIDER', 'deepgram')));
         $deepgramKey = (string) (env('DEEPGRAM_API_KEY', '') ?: getenv('DEEPGRAM_API_KEY') ?: '');
-        $hasDeepgram = trim($deepgramKey) !== '';
+        $pulseKey = trim((string) (config('services.pulse.api_key') ?: env('PULSE_API_KEY', '')));
+        $hasStt = $sttProvider === 'pulse'
+            ? ($pulseKey !== '')
+            : (trim($deepgramKey) !== '');
 
         // In intro enrollment mode, name detection requires speech-to-text.
         // Silently falling back to mock analysis makes the UI look "broken"
         // (no participants ever get enrolled), so we fail loudly instead.
-        if ($this->mode === 'intro' && !$hasDeepgram) {
-            throw new \RuntimeException('Intro enrollment requires DEEPGRAM_API_KEY (speech-to-text) to be set.');
+        if ($this->mode === 'intro' && !$hasStt) {
+            $hint = $sttProvider === 'pulse'
+                ? 'Set PULSE_API_KEY (and MEETING_STT_PROVIDER=pulse).'
+                : 'Set DEEPGRAM_API_KEY (or switch MEETING_STT_PROVIDER=pulse with PULSE_API_KEY).';
+            throw new \RuntimeException('Intro enrollment requires speech-to-text: ' . $hint);
         }
 
         // FIX #1:
@@ -175,6 +182,8 @@ class ProcessChunkJob implements ShouldQueue
         ]);
         $process->setEnv(array_merge($_SERVER, $_ENV, [
             'DEEPGRAM_API_KEY' => $deepgramKey,
+            'MEETING_STT_PROVIDER' => $sttProvider,
+            'PULSE_API_KEY' => $pulseKey,
             'PATH' => $this->buildPath(),
         ]));
         $process->setTimeout($timeout + 5);
@@ -191,7 +200,7 @@ class ProcessChunkJob implements ShouldQueue
                 $errorFromStdout = trim($maybeJson['error']);
             }
 
-            if ($hasDeepgram) {
+            if ($hasStt) {
                 $reason = $errorFromStdout ?: ($stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'unknown_error'));
                 throw new \RuntimeException("Analyzer failed (exit={$exit}): {$reason}");
             }
@@ -200,12 +209,12 @@ class ProcessChunkJob implements ShouldQueue
 
         $decoded = json_decode($process->getOutput(), true);
         if (!is_array($decoded)) {
-            if ($hasDeepgram) {
+            if ($hasStt) {
                 throw new \RuntimeException('Analyzer returned invalid JSON.');
             }
             return $this->mockAnalysis();
         }
-        if ($hasDeepgram && isset($decoded['error'])) {
+        if ($hasStt && isset($decoded['error'])) {
             throw new \RuntimeException('Analyzer error: ' . (string) $decoded['error']);
         }
 
@@ -220,7 +229,7 @@ class ProcessChunkJob implements ShouldQueue
             $normalizedSpeakers[(string) $name] = (int) $seconds;
         }
 
-        if ($hasDeepgram && count($normalizedSpeakers) === 1 && array_key_exists('Unknown', $normalizedSpeakers)) {
+        if ($hasStt && count($normalizedSpeakers) === 1 && array_key_exists('Unknown', $normalizedSpeakers)) {
             throw new \RuntimeException('Analyzer did not diarize (Unknown speaker).');
         }
 
@@ -295,14 +304,19 @@ class ProcessChunkJob implements ShouldQueue
     private function extractNameFromText(string $text): ?string
     {
         $t = strtolower(trim($text));
+        // Normalize “smart” quotes so phrases like I'm / my name's match reliably.
+        $t = str_replace(
+            ["\u{2019}", "\u{2018}", "\u{201C}", "\u{201D}"],
+            ["'", "'", '"', '"'],
+            $t
+        );
         $t = preg_replace('/\s+/', ' ', $t) ?? $t;
 
-        // Match "my name is X", "i am X", "this is X", "im X", "i'm X"
-        // Capture up to 3 words after the phrase (letters only) to support full names.
+        // Match common enrollment phrases. Capture up to 3 words (letters) for full names.
         // We still take the LAST match to avoid bleed-over from earlier speakers.
         $matches = [];
         preg_match_all(
-            '/\b(?:my name is|i am|this is|im|i\'m)\s+([a-z][a-z]{1,29}(?:\s+[a-z][a-z]{1,29}){0,2})\b/i',
+            '/\b(?:my name is|my name\'s|i am|this is|it\'s|its|im|i\'m|call me|you can call me)\s+([a-z][a-z]{1,29}(?:\s+[a-z][a-z]{1,29}){0,2})\b/iu',
             $t,
             $matches
         );
@@ -381,10 +395,24 @@ class ProcessChunkJob implements ShouldQueue
         return implode(':', $parts);
     }
 
-    private function buildMeetingNlp(array $speakerText): array
+    private function buildMeetingNlp(int $meetingId, array $speakerText): array
     {
+        $labels = array_map(fn ($k) => (string) $k, array_keys($speakerText));
+        $rows = SpeakerMapping::query()
+            ->with('participant:id,name')
+            ->where('meeting_id', $meetingId)
+            ->whereIn('speaker_label', $labels)
+            ->get();
+
+        $labelToName = [];
+        foreach ($rows as $r) {
+            $lbl = (string) ($r->speaker_label ?? '');
+            if ($lbl === '') continue;
+            $labelToName[$lbl] = (string) ($r->participant?->name ?? $lbl);
+        }
+
         $full = trim(implode("\n", array_map(
-            fn ($label, $t) => '[' . (string) $label . '] ' . trim((string) $t),
+            fn ($label, $t) => '[' . (string) ($labelToName[(string) $label] ?? (string) $label) . '] ' . trim((string) $t),
             array_keys($speakerText),
             array_values($speakerText),
         )));
@@ -679,7 +707,7 @@ class ProcessChunkJob implements ShouldQueue
                     );
                 }
 
-                $nlp = $this->buildMeetingNlp($speakerText);
+                $nlp = $this->buildMeetingNlp($meetingId, $speakerText);
                 MeetingAnalytic::updateOrCreate(
                     ['meeting_id' => $meetingId],
                     [
@@ -830,8 +858,25 @@ class ProcessChunkJob implements ShouldQueue
         }
 
         $speakerText = is_array($analysis['speaker_text'] ?? null) ? $analysis['speaker_text'] : [];
+
+        // Map diarization labels like "speaker_0" to enrolled participant names
+        // so transcript excerpts and NLP insights don't show raw speaker_0 tags.
+        $labels = array_map(fn ($k) => (string) $k, array_keys($speakerText));
+        $rows = SpeakerMapping::query()
+            ->with('participant:id,name')
+            ->where('meeting_id', $meetingId)
+            ->whereIn('speaker_label', $labels)
+            ->get();
+
+        $labelToName = [];
+        foreach ($rows as $r) {
+            $lbl = (string) ($r->speaker_label ?? '');
+            if ($lbl === '') continue;
+            $labelToName[$lbl] = (string) ($r->participant?->name ?? $lbl);
+        }
+
         $text = trim(implode("\n", array_map(
-            fn ($label, $t) => '[' . (string) $label . '] ' . trim((string) $t),
+            fn ($label, $t) => '[' . (string) ($labelToName[(string) $label] ?? $label) . '] ' . trim((string) $t),
             array_keys($speakerText),
             array_values($speakerText),
         )));

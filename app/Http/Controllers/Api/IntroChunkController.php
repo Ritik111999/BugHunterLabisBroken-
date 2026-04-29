@@ -25,13 +25,37 @@ class IntroChunkController extends Controller
 
         $chunkIndex = (int) $validated['chunk_index'];
         $durationSeconds = isset($validated['duration_seconds']) ? (float) $validated['duration_seconds'] : null;
-        $sync = filter_var($request->query('sync', true), FILTER_VALIDATE_BOOL);
+        // Default async: intro analysis needs Deepgram + ffmpeg + optional SpeechBrain.
+        // Use ?sync=1 from the demo (or tooling) to run inline without a queue worker.
+        $sync = filter_var($request->query('sync', false), FILTER_VALIDATE_BOOL);
 
         $filePath = $this->storeChunkFile($request, $id, $chunkIndex);
 
         if ($sync) {
-            // Intro processing can be slow (Deepgram + Python + model load).
-            // For UX, prefer async by default even when sync=1 is provided.
+            try {
+                ProcessChunkJob::dispatchSync(
+                    meetingId: $id,
+                    filePath: $filePath,
+                    chunkIndex: $chunkIndex,
+                    mode: 'intro',
+                    durationSeconds: $durationSeconds,
+                );
+            } catch (\Throwable $e) {
+                return response()->json([
+                    'status' => 'failed',
+                    'error' => $e->getMessage(),
+                    'meeting_id' => $id,
+                    'chunk_index' => $chunkIndex,
+                    'mode' => 'intro',
+                ], 422);
+            }
+
+            return response()->json([
+                'status' => 'completed',
+                'meeting_id' => $id,
+                'chunk_index' => $chunkIndex,
+                'mode' => 'intro',
+            ], 200);
         }
 
         ProcessChunkJob::dispatch(

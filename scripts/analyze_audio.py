@@ -31,7 +31,7 @@ from array import array
 import urllib.parse
 import urllib.request
 import urllib.error
-from typing import Dict, Tuple, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
@@ -105,10 +105,16 @@ def run_diarization(
     """
     Deduces speaker talk time and overlap seconds.
 
-    Provider order:
-    - Deepgram (if DEEPGRAM_API_KEY is set)
-    - fallback to ImportError (caller will handle)
+    Providers (MEETING_STT_PROVIDER):
+    - pulse: PULSE_API_KEY → Smallest AI Waves HTTP get_text
+    - deepgram (default): DEEPGRAM_API_KEY → Deepgram pre-recorded
     """
+    provider = (os.getenv("MEETING_STT_PROVIDER", "deepgram") or "deepgram").strip().lower()
+    pulse_key = (os.getenv("PULSE_API_KEY", "")).strip()
+    if provider == "pulse" and pulse_key:
+        return run_pulse_http_diarization(
+            path, intro_seconds=intro_seconds, timeout=timeout, api_key=pulse_key, mode=mode
+        )
     deepgram_key = (deepgram_key_override or os.getenv("DEEPGRAM_API_KEY", "")).strip()
     if deepgram_key:
         return run_deepgram_diarization(path, intro_seconds=intro_seconds, timeout=timeout, api_key=deepgram_key, mode=mode)
@@ -514,6 +520,139 @@ def run_deepgram_diarization(
                 pass
 
 
+def run_pulse_http_diarization(
+    path: str,
+    intro_seconds: float,
+    timeout: int,
+    api_key: str,
+    mode: str = "meeting",
+) -> Tuple[Dict[str, int], int, Dict[str, str], Dict[str, List[Tuple[float, float]]], Optional[float]]:
+    """
+    Smallest AI Pulse pre-recorded: POST linear16 WAV to get_text.
+    Returns the same tuple shape as run_deepgram_diarization.
+    """
+    lang = (os.getenv("PULSE_LANGUAGE", "en") or "en").strip()
+    params = {
+        "language": lang,
+        "word_timestamps": "true",
+        "sentence_timestamps": "true",
+        "diarize": "true",
+        "numerals": "auto",
+    }
+    url = "https://api.smallest.ai/waves/v1/pulse/get_text?" + urllib.parse.urlencode(params)
+
+    temp_path: Optional[str] = None
+    try:
+        if str(mode).lower() == "intro":
+            temp_path = _convert_to_wav_mono_16k_loudnorm(path, timeout=timeout, max_seconds=None)
+        else:
+            temp_path = _convert_to_wav_mono_16k(path, timeout)
+        with open(temp_path, "rb") as f:
+            body = f.read()
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "audio/wav",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        msg = f"Pulse HTTP {getattr(e, 'code', '?')}: {getattr(e, 'reason', '')}".strip()
+        if body:
+            msg += f" — {body.strip()}"
+        raise RuntimeError(msg) from e
+
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise RuntimeError("Pulse returned invalid JSON")
+    if data.get("error"):
+        raise RuntimeError(str(data.get("error")))
+
+    per_speaker_seconds: Dict[str, float] = {}
+    per_speaker_text: Dict[str, str] = {}
+    per_speaker_intervals: Dict[str, List[Tuple[float, float]]] = {}
+    all_intervals: List[Tuple[float, float]] = []
+
+    utterances = data.get("utterances")
+    if isinstance(utterances, list) and len(utterances) > 0:
+        for u in utterances:
+            if not isinstance(u, dict):
+                continue
+            speaker = u.get("speaker")
+            start = float(u.get("start") or 0.0)
+            end = float(u.get("end") or 0.0)
+            start = max(start - max(0.0, intro_seconds), 0.0)
+            end = max(end - max(0.0, intro_seconds), 0.0)
+            if end <= start:
+                continue
+            key = f"speaker_{int(speaker) if speaker is not None else 0}"
+            per_speaker_seconds[key] = per_speaker_seconds.get(key, 0.0) + (end - start)
+            per_speaker_intervals.setdefault(key, []).append((start, end))
+            all_intervals.append((start, end))
+            t = str(u.get("text") or u.get("transcript") or "").strip()
+            if t:
+                per_speaker_text[key] = (per_speaker_text.get(key, "") + " " + t).strip()
+    else:
+        words: List[Any] = []
+        if isinstance(data.get("words"), list):
+            words = data.get("words") or []
+        if not words:
+            channels = data.get("channels") or []
+            if isinstance(channels, list) and len(channels) > 0:
+                try:
+                    words = channels[0]["alternatives"][0]["words"]
+                except Exception:
+                    words = []
+
+        if not isinstance(words, list) or len(words) == 0:
+            transcript = str(data.get("transcript") or "").strip()
+            if transcript:
+                return {}, 0, {"speaker_0": transcript}, {}, 0.0
+            return {}, 0, {}, {}, 0.0
+
+        for w in words:
+            if not isinstance(w, dict):
+                continue
+            speaker = w.get("speaker")
+            start = float(w.get("start") or 0.0)
+            end = float(w.get("end") or 0.0)
+            start = max(start - max(0.0, intro_seconds), 0.0)
+            end = max(end - max(0.0, intro_seconds), 0.0)
+            if end <= start:
+                continue
+            key = f"speaker_{int(speaker) if speaker is not None else 0}"
+            per_speaker_seconds[key] = per_speaker_seconds.get(key, 0.0) + (end - start)
+            per_speaker_intervals.setdefault(key, []).append((start, end))
+            all_intervals.append((start, end))
+            t = str(w.get("punctuated_word") or w.get("word") or "").strip()
+            if t:
+                per_speaker_text[key] = (per_speaker_text.get(key, "") + " " + t).strip()
+
+    speaker_seconds_int = {k: max(1, int(round(v))) for k, v in per_speaker_seconds.items() if v > 0.0}
+    overlap_seconds = _compute_overlap_seconds(all_intervals)
+    inferred_duration = None
+    if len(all_intervals) > 0:
+        inferred_duration = max(e for _s, e in all_intervals)
+    return speaker_seconds_int, overlap_seconds, per_speaker_text, per_speaker_intervals, inferred_duration
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", required=True)
@@ -530,10 +669,12 @@ def main() -> int:
         return 2
 
     try:
+        provider = (os.getenv("MEETING_STT_PROVIDER", "deepgram") or "deepgram").strip().lower()
+        pulse_key = (os.getenv("PULSE_API_KEY", "")).strip()
         deepgram_key = (str(args.deepgram_key or "")).strip() or os.getenv("DEEPGRAM_API_KEY", "").strip()
-        deepgram_enabled = deepgram_key != ""
+        stt_enabled = (provider == "pulse" and pulse_key != "") or (provider != "pulse" and deepgram_key != "")
 
-        # Prefer ffprobe for duration, but allow Deepgram-only mode when ffprobe isn't available.
+        # Prefer ffprobe for duration, but allow STT-only mode when ffprobe isn't available.
         total_after_intro = None
         ffprobe_error = None
         try:
@@ -547,7 +688,7 @@ def main() -> int:
                 path, args.intro_seconds, args.timeout, deepgram_key_override=deepgram_key, mode=str(args.mode or "meeting")
             )
         except Exception:
-            if deepgram_enabled:
+            if stt_enabled:
                 raise
             if total_after_intro is None:
                 # No duration + no diarization means we can't produce anything useful.
@@ -565,7 +706,10 @@ def main() -> int:
             total_after_intro = analyzed_window(inferred_duration, 0.0)
 
         speaker_embeddings: Dict[str, List[float]] = {}
-        if deepgram_enabled and isinstance(speaker_intervals, dict) and len(speaker_intervals) > 0:
+        # Intro enrollment prioritizes fast name capture; skip per-speaker
+        # embedding extraction here to reduce post-upload wait.
+        is_intro_mode = str(args.mode or "").lower() == "intro"
+        if (not is_intro_mode) and stt_enabled and isinstance(speaker_intervals, dict) and len(speaker_intervals) > 0:
             speaker_embeddings = _compute_speaker_embeddings(
                 audio_path=path,
                 speaker_intervals=speaker_intervals,
@@ -598,8 +742,8 @@ def main() -> int:
     except Exception as e:
         msg = str(e)
         # Helpful hint when ffprobe is missing and Deepgram key isn't present.
-        if ("ffprobe" in msg or "No such file or directory: 'ffprobe'" in msg) and not deepgram_key:
-            msg = msg + " (DEEPGRAM_API_KEY not set in analyzer env)"
+        if ("ffprobe" in msg or "No such file or directory: 'ffprobe'" in msg) and not stt_enabled:
+            msg = msg + " (no STT keys: set DEEPGRAM_API_KEY or PULSE_API_KEY + MEETING_STT_PROVIDER=pulse)"
         # Always print a machine-readable error on stdout (caller parses this),
         # and a human-readable message on stderr (so Process error output isn't empty).
         print(json.dumps({"error": msg}))

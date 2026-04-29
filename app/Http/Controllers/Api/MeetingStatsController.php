@@ -123,7 +123,7 @@ class MeetingStatsController extends Controller
                     flush();
                 }
 
-                usleep(750000); // 0.75s
+                usleep(500000); // 0.5s (500ms)
             }
         });
 
