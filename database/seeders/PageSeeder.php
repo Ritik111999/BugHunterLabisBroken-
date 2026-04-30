@@ -12,22 +12,29 @@ class PageSeeder extends Seeder
      */
     public function run()
     {
-        Page::insert([
+        $pages = [
             [
                 'type' => 'about',
                 'title' => 'About Us',
-                'content' => 'This is about us content',
+                'content' => 'WeChirp helps teams turn meetings into searchable insights.',
             ],
             [
                 'type' => 'privacy',
                 'title' => 'Privacy Policy',
-                'content' => 'This is privacy policy',
+                'content' => 'This is placeholder Privacy Policy content for development/testing.',
             ],
             [
                 'type' => 'terms',
                 'title' => 'Terms of Service',
-                'content' => 'These are terms',
+                'content' => 'These are placeholder Terms of Service for development/testing.',
             ],
-        ]);
+        ];
+
+        foreach ($pages as $p) {
+            Page::query()->updateOrCreate(
+                ['type' => $p['type']],
+                ['title' => $p['title'], 'content' => $p['content']]
+            );
+        }
     }
 }

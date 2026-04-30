@@ -101,6 +101,7 @@ def run_diarization(
     timeout: int,
     deepgram_key_override: Optional[str] = None,
     mode: str = "meeting",
+    max_seconds: Optional[float] = None,
 ) -> Tuple[Dict[str, int], int, Dict[str, str], Dict[str, List[Tuple[float, float]]], Optional[float]]:
     """
     Deduces speaker talk time and overlap seconds.
@@ -117,7 +118,14 @@ def run_diarization(
         )
     deepgram_key = (deepgram_key_override or os.getenv("DEEPGRAM_API_KEY", "")).strip()
     if deepgram_key:
-        return run_deepgram_diarization(path, intro_seconds=intro_seconds, timeout=timeout, api_key=deepgram_key, mode=mode)
+        return run_deepgram_diarization(
+            path,
+            intro_seconds=intro_seconds,
+            timeout=timeout,
+            api_key=deepgram_key,
+            mode=mode,
+            max_seconds=max_seconds,
+        )
     raise ImportError("No diarization provider configured")
 
 
@@ -368,6 +376,7 @@ def run_deepgram_diarization(
     timeout: int,
     api_key: str,
     mode: str = "meeting",
+    max_seconds: Optional[float] = None,
 ) -> Tuple[Dict[str, int], int, Dict[str, str], Dict[str, List[Tuple[float, float]]], Optional[float]]:
     """
     Uses Deepgram diarization. Returns (speaker_seconds, overlap_seconds).
@@ -386,7 +395,9 @@ def run_deepgram_diarization(
     temp_norm = None
     send_path = path
     if str(mode).lower() == "intro":
-        temp_norm = _convert_to_wav_mono_16k_loudnorm(path, timeout=timeout, max_seconds=None)
+        # Cap to the requested intro duration to keep enrollment snappy.
+        # NOTE: Loudnorm is helpful but can be slow on longer clips; keep it bounded.
+        temp_norm = _convert_to_wav_mono_16k_loudnorm(path, timeout=timeout, max_seconds=max_seconds)
         send_path = temp_norm
 
     with open(send_path, "rb") as f:
@@ -683,9 +694,17 @@ def main() -> int:
         except Exception as e:
             ffprobe_error = e
 
+        max_s = float(args.max_seconds or 0.0)
+        max_s = None if max_s <= 0 else max(1.0, min(60.0, max_s))
+
         try:
             speakers, overlap, speaker_text, speaker_intervals, inferred_duration = run_diarization(
-                path, args.intro_seconds, args.timeout, deepgram_key_override=deepgram_key, mode=str(args.mode or "meeting")
+                path,
+                args.intro_seconds,
+                args.timeout,
+                deepgram_key_override=deepgram_key,
+                mode=str(args.mode or "meeting"),
+                max_seconds=max_s,
             )
         except Exception:
             if stt_enabled:
@@ -717,11 +736,11 @@ def main() -> int:
                 timeout=int(args.timeout),
             )
 
-        max_s = float(args.max_seconds or 0.0)
-        max_s = None if max_s <= 0 else max(1.0, min(60.0, max_s))
-
         global_embedding = None
-        if str(args.mode or "").lower() == "intro":
+        # Intro enrollment: default to NO embedding so name enrollment feels instant.
+        # Enable only if explicitly requested (slower due to SpeechBrain model + ffmpeg).
+        want_intro_embed = (os.getenv("MEETING_INTRO_GLOBAL_EMBEDDING", "0").strip().lower() in ("1", "true", "yes", "y"))
+        if str(args.mode or "").lower() == "intro" and want_intro_embed:
             global_embedding = _compute_global_embedding(
                 audio_path=path,
                 intro_seconds=float(args.intro_seconds),

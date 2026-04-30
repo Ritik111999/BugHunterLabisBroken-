@@ -52,12 +52,28 @@ public function index()
         return response()->json(['message' => 'Meeting started']);
     }
 
-    public function end($id)
+    public function end(Request $request, $id)
     {
-        $meeting = Meeting::findOrFail($id);
+        $meeting = Meeting::query()
+            ->whereKey((int) $id)
+            ->where('host_id', auth()->id())
+            ->firstOrFail();
+
+        $validated = $request->validate([
+            'duration_seconds' => ['nullable', 'numeric', 'min:0', 'max:86400'],
+        ]);
+
+        $durationSeconds = null;
+        if (array_key_exists('duration_seconds', $validated) && $validated['duration_seconds'] !== null) {
+            $durationSeconds = (int) round((float) $validated['duration_seconds']);
+        } elseif ($meeting->started_at) {
+            $durationSeconds = (int) $meeting->started_at->diffInSeconds(now());
+        }
+
         $meeting->update([
             'ended_at' => now(),
-            'status' => 'completed'
+            'status' => 'completed',
+            'duration' => $durationSeconds,
         ]);
 
         return response()->json(['message' => 'Meeting ended']);

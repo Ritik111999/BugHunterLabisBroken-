@@ -1286,9 +1286,11 @@ class DeepgramLiveRelayConnection
         $this->loadEnrolledVoiceprints($meetingId);
         $this->embedEveryN = max(1, (int) (env('MEETING_WS_EMBED_EVERY_N', 5)));
         $this->bootstrapChunks = max(1, (int) (env('MEETING_WS_BOOTSTRAP_CHUNKS', 8)));
-        $this->labelWindowSeconds = (float) (env('MEETING_WS_LABEL_WINDOW_SECONDS', 8));
-        $this->labelMinSpeechSeconds = (float) (env('MEETING_WS_LABEL_MIN_SPEECH_SECONDS', 2.5));
-        $this->labelEmbedCooldownSeconds = (float) (env('MEETING_WS_LABEL_EMBED_COOLDOWN_SECONDS', 4));
+        // Faster, more "instant" identity locking defaults (tunable via .env).
+        // Keep these conservative enough to avoid flicker, but responsive for live UI.
+        $this->labelWindowSeconds = (float) (env('MEETING_WS_LABEL_WINDOW_SECONDS', 2.0));          // evidence window
+        $this->labelMinSpeechSeconds = (float) (env('MEETING_WS_LABEL_MIN_SPEECH_SECONDS', 1.0));   // minimum speech to embed
+        $this->labelEmbedCooldownSeconds = (float) (env('MEETING_WS_LABEL_EMBED_COOLDOWN_SECONDS', 1.5));
         $this->labelMinPurity = (float) (env('MEETING_WS_LABEL_MIN_PURITY', 0.65));
         if ($sttProvider === 'pulse') {
             // Pulse can produce long interim stretches before final boundaries.
@@ -1307,7 +1309,7 @@ class DeepgramLiveRelayConnection
 
         // Coalesce frontend updates on timers (prevents 1006 from browser overload).
         // User-facing "bar update" cadence is controlled here.
-        $statsIntervalSeconds = (float) (env('MEETING_WS_STATS_INTERVAL_SECONDS', 0.5));
+        $statsIntervalSeconds = (float) (env('MEETING_WS_STATS_INTERVAL_SECONDS', 0.2));
         $statsIntervalSeconds = max(0.05, min(2.0, $statsIntervalSeconds)); // safety clamp
         $this->statsTimerId = EventLoop::repeat($statsIntervalSeconds, function () use ($frontend, $meetingId) {
             if ($frontend->isClosed()) {
@@ -1357,7 +1359,9 @@ class DeepgramLiveRelayConnection
 
         // Voice embedding is CPU-heavy (ffmpeg + python). Run slower and single-flight
         // so matching works without degrading live transcript latency.
-        $this->voiceEmbedTimerId = EventLoop::repeat(2.8, function () use ($meetingId) {
+        $voiceEmbedIntervalSeconds = (float) (env('MEETING_WS_VOICE_EMBED_INTERVAL_SECONDS', 1.2));
+        $voiceEmbedIntervalSeconds = max(0.6, min(6.0, $voiceEmbedIntervalSeconds));
+        $this->voiceEmbedTimerId = EventLoop::repeat($voiceEmbedIntervalSeconds, function () use ($meetingId) {
             if ($this->voiceEmbeddingBusy) {
                 return;
             }

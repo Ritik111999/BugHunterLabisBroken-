@@ -5,6 +5,7 @@ namespace App\Models;
 // use Illuminate\Contracts\Auth\MustVerifyEmail;
 use App\Models\Meeting;
 use App\Models\MeetingParticipant;
+use App\Models\Role;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -73,5 +74,21 @@ public function currentPlan(): ?SubscriptionPlan
         return $sub->plan;
     }
     return SubscriptionPlan::query()->where('code', 'basic')->first();
+}
+
+public function roles()
+{
+    return $this->belongsToMany(Role::class);
+}
+
+public function hasRole(string $name): bool
+{
+    return $this->roles()->where('name', $name)->exists();
+}
+
+public function assignRole(string $name): void
+{
+    $role = Role::query()->firstOrCreate(['name' => $name]);
+    $this->roles()->syncWithoutDetaching([$role->id]);
 }
 }

@@ -15,5 +15,8 @@ class ContactMessage extends Model
         'email',
         'subject',
         'message',
+        'status',
+        'admin_reply',
+        'replied_at',
     ];
 }

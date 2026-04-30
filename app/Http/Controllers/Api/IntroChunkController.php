@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Jobs\ProcessChunkJob;
+use App\Models\MeetingParticipant;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -32,6 +33,7 @@ class IntroChunkController extends Controller
         $filePath = $this->storeChunkFile($request, $id, $chunkIndex);
 
         if ($sync) {
+            $startedAt = now();
             try {
                 ProcessChunkJob::dispatchSync(
                     meetingId: $id,
@@ -50,11 +52,28 @@ class IntroChunkController extends Controller
                 ], 422);
             }
 
+            // Return newly enrolled participants so the client UI can update instantly.
+            // We consider "enrolled" any participant updated/created by intro enrollment.
+            $enrolled = MeetingParticipant::query()
+                ->where('meeting_id', $id)
+                ->where(function ($q) use ($startedAt) {
+                    $q->where('created_at', '>=', $startedAt->copy()->subSeconds(2))
+                        ->orWhere('updated_at', '>=', $startedAt->copy()->subSeconds(2));
+                })
+                ->get(['id', 'name', 'voice_embedding'])
+                ->values()
+                ->map(fn ($p) => [
+                    'id' => (int) $p->id,
+                    'name' => (string) $p->name,
+                    'voice_embedding' => $p->voice_embedding,
+                ]);
+
             return response()->json([
                 'status' => 'completed',
                 'meeting_id' => $id,
                 'chunk_index' => $chunkIndex,
                 'mode' => 'intro',
+                'enrolled_participants' => $enrolled,
             ], 200);
         }
 

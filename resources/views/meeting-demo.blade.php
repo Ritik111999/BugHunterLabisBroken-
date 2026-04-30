@@ -280,8 +280,31 @@ const state = {
     },
     ws: { socket: null, connected: false },
     sse: null,
+    statsPollTimer: null,
     audio: { lastSentAt: 0, keepaliveTimer: null },
 };
+
+// ─────────────────────────── Fast polling (0.5s) ───────────────────────────
+function startStatsPolling() {
+    stopStatsPolling();
+    if (!state.meetingId) return;
+
+    // Poll DB-backed stats so bars refresh even if WS is slower.
+    state.statsPollTimer = setInterval(async () => {
+        try {
+            if (!state.meeting.running || state.meeting.paused) return;
+            const payload = await api(`/api/meetings/${state.meetingId}/stats`);
+            renderBars(payload);
+        } catch {}
+    }, 500);
+}
+
+function stopStatsPolling() {
+    if (state.statsPollTimer) {
+        try { clearInterval(state.statsPollTimer); } catch {}
+        state.statsPollTimer = null;
+    }
+}
 
 // ─────────────────────────── Persist ───────────────────────────
 function loadPrefs() {
@@ -589,15 +612,23 @@ async function enrollOneParticipant() {
 
     if (res?.status === 'failed') throw new Error(String(res.error || 'analyzer_failed'));
 
-    let newNames = [];
-    await refreshParticipants();
-    newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
-    // One short retry in case the list endpoint reads slightly stale.
-    if (newNames.length === 0) {
-        await sleep(400);
-        await refreshParticipants();
-        newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
+    // Fast-path: use server response to update UI instantly.
+    const enrolled = Array.isArray(res?.enrolled_participants) ? res.enrolled_participants : [];
+    if (enrolled.length > 0) {
+        // Merge into current state without waiting for another HTTP call.
+        const byId = new Map(state.participants.map(p => [String(p.id), p]));
+        enrolled.forEach(p => {
+            const id = String(p.id);
+            byId.set(id, { id: p.id, name: p.name, voice_embedding: p.voice_embedding ?? null });
+        });
+        state.participants = Array.from(byId.values());
+        renderParticipants();
+        updateStartBtn();
     }
+
+    // Backstop: refresh list once (handles cases where participant was renamed/merged).
+    await refreshParticipants();
+    const newNames = state.participants.filter(p => !isPlaceholder(p.name) && !beforeNames.has(p.name.toLowerCase()));
 
     state.introEnrolling = false;
     if (newNames.length > 0) {
@@ -670,6 +701,12 @@ $('btnStartMeeting').addEventListener('click', async () => {
             startHttpChunks();
             startSse();
             $('transcriptMode').textContent = 'Polling (HTTP chunks)';
+        }
+
+        // In WS mode, bars update via relay pushes (stats.updated).
+        // In HTTP chunk mode, we also poll DB stats every 0.5s for smoother UI.
+        if (!useWs) {
+            startStatsPolling();
         }
     } catch(e) { alert('Start meeting failed: ' + e.message); }
 });
@@ -1050,7 +1087,16 @@ $('btnEnd').addEventListener('click', async () => {
     if (state.meeting.timer) { clearInterval(state.meeting.timer); state.meeting.timer = null; }
 
     logEvent('Ending meeting…');
-    try { await api(`/api/meetings/${state.meetingId}/end`, { method: 'POST' }); } catch {}
+    try {
+        const durationSeconds = state.meeting.startedAt
+            ? Math.max(0, (Date.now() - state.meeting.startedAt) / 1000)
+            : null;
+        await api(`/api/meetings/${state.meetingId}/end`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration_seconds: durationSeconds }),
+        });
+    } catch {}
 
     // Give relay 1.5s to flush final stats then show analytics
     await sleep(1500);
@@ -1059,6 +1105,7 @@ $('btnEnd').addEventListener('click', async () => {
 
 function stopMic() {
     state.meeting.running = false;
+    stopStatsPolling();
     try { state.meeting.recorder?.stop(); } catch {}
     try { state.meeting.stream?.getTracks().forEach(t => t.stop()); } catch {}
     try { state.meeting.audioCtx?.close(); } catch {}
