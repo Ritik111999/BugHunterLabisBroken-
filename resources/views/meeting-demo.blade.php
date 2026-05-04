@@ -278,7 +278,7 @@ const state = {
         stream: null, recorder: null,
         audioCtx: null,
     },
-    ws: { socket: null, connected: false },
+    ws: { socket: null, connected: false, useServerAudioClock: false },
     sse: null,
     statsPollTimer: null,
     audio: { lastSentAt: 0, keepaliveTimer: null },
@@ -694,6 +694,11 @@ $('btnStartMeeting').addEventListener('click', async () => {
 
         const useWs = $('useWs').checked;
         if (useWs) {
+            if (state.meeting.timer) {
+                clearInterval(state.meeting.timer);
+                state.meeting.timer = null;
+            }
+            state.ws.useServerAudioClock = true;
             startWs();
             $('transcriptMode').textContent = 'Bars only (WebSocket realtime)';
             $('liveTranscript').innerHTML = '<div class="text-xs text-slate-400">Live transcript disabled for ultra-low latency mode.</div>';
@@ -712,6 +717,27 @@ $('btnStartMeeting').addEventListener('click', async () => {
 });
 
 // ─────────────────────────── WebSocket live ───────────────────────────
+/** Merge rapid stats.updated messages into one paint per animation frame. */
+function scheduleWsStatsFrame(data) {
+    scheduleWsStatsFrame._pending = data;
+    if (scheduleWsStatsFrame._id != null) return;
+    scheduleWsStatsFrame._id = requestAnimationFrame(() => {
+        scheduleWsStatsFrame._id = null;
+        const p = scheduleWsStatsFrame._pending;
+        scheduleWsStatsFrame._pending = null;
+        if (p) {
+            renderBars(p);
+            renderVoiceDebug(p);
+            if (state.ws.useServerAudioClock && state.meeting.running) {
+                const live = Number(p.live_audio_seconds);
+                if (Number.isFinite(live) && live >= 0) {
+                    $('elapsed').textContent = formatElapsed(live * 1000);
+                }
+            }
+        }
+    });
+}
+
 function startWs() {
     const token  = state.token;
     const base   = $('relayWsUrl').value.trim().replace(/\/$/, '');
@@ -760,7 +786,7 @@ function startWs() {
         try {
             const msg = JSON.parse(String(ev.data || ''));
             if (msg?.error) { logEvent(`WS error: ${msg.error}${msg.message ? ' – ' + msg.message : ''}`); return; }
-            if (msg?.event === 'stats.updated')      { renderBars(msg.data); renderVoiceDebug(msg.data); }
+            if (msg?.event === 'stats.updated') scheduleWsStatsFrame(msg.data);
             if (msg?.event === 'transcript.updated') renderLiveLines(msg.data?.lines || []);
         } catch {}
     };
@@ -1114,6 +1140,7 @@ function stopMic() {
     state.audio.keepaliveTimer = null;
     state.ws.socket    = null;
     state.ws.connected = false;
+    state.ws.useServerAudioClock = false;
     state.meeting.recorder = null;
     state.meeting.stream   = null;
     state.meeting.audioCtx = null;

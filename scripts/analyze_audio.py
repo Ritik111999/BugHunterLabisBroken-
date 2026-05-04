@@ -114,7 +114,12 @@ def run_diarization(
     pulse_key = (os.getenv("PULSE_API_KEY", "")).strip()
     if provider == "pulse" and pulse_key:
         return run_pulse_http_diarization(
-            path, intro_seconds=intro_seconds, timeout=timeout, api_key=pulse_key, mode=mode
+            path,
+            intro_seconds=intro_seconds,
+            timeout=timeout,
+            api_key=pulse_key,
+            mode=mode,
+            max_seconds=max_seconds,
         )
     deepgram_key = (deepgram_key_override or os.getenv("DEEPGRAM_API_KEY", "")).strip()
     if deepgram_key:
@@ -537,6 +542,7 @@ def run_pulse_http_diarization(
     timeout: int,
     api_key: str,
     mode: str = "meeting",
+    max_seconds: Optional[float] = None,
 ) -> Tuple[Dict[str, int], int, Dict[str, str], Dict[str, List[Tuple[float, float]]], Optional[float]]:
     """
     Smallest AI Pulse pre-recorded: POST linear16 WAV to get_text.
@@ -555,7 +561,8 @@ def run_pulse_http_diarization(
     temp_path: Optional[str] = None
     try:
         if str(mode).lower() == "intro":
-            temp_path = _convert_to_wav_mono_16k_loudnorm(path, timeout=timeout, max_seconds=None)
+            # Match Deepgram intro: cap decode so ffmpeg loudnorm stays fast on short clips.
+            temp_path = _convert_to_wav_mono_16k_loudnorm(path, timeout=timeout, max_seconds=max_seconds)
         else:
             temp_path = _convert_to_wav_mono_16k(path, timeout)
         with open(temp_path, "rb") as f:
@@ -725,22 +732,26 @@ def main() -> int:
             total_after_intro = analyzed_window(inferred_duration, 0.0)
 
         speaker_embeddings: Dict[str, List[float]] = {}
-        # Intro enrollment prioritizes fast name capture; skip per-speaker
-        # embedding extraction here to reduce post-upload wait.
         is_intro_mode = str(args.mode or "").lower() == "intro"
-        if (not is_intro_mode) and stt_enabled and isinstance(speaker_intervals, dict) and len(speaker_intervals) > 0:
-            speaker_embeddings = _compute_speaker_embeddings(
-                audio_path=path,
-                speaker_intervals=speaker_intervals,
-                intro_seconds=float(args.intro_seconds),
-                timeout=int(args.timeout),
-            )
+        # Meeting mode: per-speaker ECAPA from diarization intervals.
+        # Intro: optional per-label embeddings (second Torch pass); default off — use global_embedding below.
+        per_label_intro = (os.getenv("MEETING_INTRO_PER_LABEL_VOICEPRINT", "0").strip().lower() in ("1", "true", "yes", "y"))
+        if stt_enabled and isinstance(speaker_intervals, dict) and len(speaker_intervals) > 0:
+            if (not is_intro_mode) or per_label_intro:
+                speaker_embeddings = _compute_speaker_embeddings(
+                    audio_path=path,
+                    speaker_intervals=speaker_intervals,
+                    intro_seconds=float(args.intro_seconds),
+                    timeout=int(args.timeout),
+                )
 
         global_embedding = None
-        # Intro enrollment: default to NO embedding so name enrollment feels instant.
-        # Enable only if explicitly requested (slower due to SpeechBrain model + ffmpeg).
-        want_intro_embed = (os.getenv("MEETING_INTRO_GLOBAL_EMBEDDING", "0").strip().lower() in ("1", "true", "yes", "y"))
-        if str(args.mode or "").lower() == "intro" and want_intro_embed:
+        # Intro enrollment: global ECAPA voiceprint in this analyzer run (ProcessChunkJob prefers it over embed_audio.php).
+        # MEETING_INTRO_ANALYZER_VOICEPRINT=1 (default) = include voiceprint; 0 = names/transcript only from STT.
+        # MEETING_INTRO_SKIP_VOICEPRINT=1 forces off (legacy override).
+        skip_legacy = (os.getenv("MEETING_INTRO_SKIP_VOICEPRINT", "0").strip().lower() in ("1", "true", "yes", "y"))
+        want_analyzer_vp = (os.getenv("MEETING_INTRO_ANALYZER_VOICEPRINT", "1").strip().lower() not in ("0", "false", "no", "n"))
+        if is_intro_mode and want_analyzer_vp and not skip_legacy:
             global_embedding = _compute_global_embedding(
                 audio_path=path,
                 intro_seconds=float(args.intro_seconds),

@@ -25,10 +25,12 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Laravel\Sanctum\PersonalAccessToken;
 use Psr\Log\NullLogger;
-use Revolt\EventLoop;
-use Symfony\Component\Process\Process;
+use Amp\Process\Process;
 use Amp\Websocket\WebsocketCloseCode;
+use Revolt\EventLoop;
 use Throwable;
+use function Amp\async;
+use function Amp\ByteStream\buffer;
 use function Amp\trapSignal;
 
 class DeepgramLiveRelay
@@ -213,6 +215,7 @@ class DeepgramLiveRelayConnection
     private float $lastTalkClockSpeechSum = 0.0;
     private float $lastTalkClockAudioCursor = 0.0;
     private float $lastImmediateTranscriptPushAt = 0.0;
+    private float $lastImmediateStatsPushAt = 0.0;
     private float $lastSeenSegmentsPruneAt = 0.0;
     private bool $voiceEmbeddingBusy = false;
     private float $lastRealtimeAllocCursor = 0.0;
@@ -725,22 +728,24 @@ class DeepgramLiveRelayConnection
 
     private function probeDurationSeconds(string $absolutePath): float
     {
-        $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
-        $p = new Process([
-            'ffprobe',
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            $absolutePath,
-        ]);
-        $p->setTimeout($timeout);
-        $p->run();
-        if (!$p->isSuccessful()) {
+        try {
+            [$exit, $out] = $this->runSubprocess([
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                $absolutePath,
+            ]);
+            if ($exit !== 0) {
+                return 0.0;
+            }
+            $out = trim($out);
+            $v = is_numeric($out) ? (float) $out : 0.0;
+
+            return max(0.0, $v);
+        } catch (Throwable) {
             return 0.0;
         }
-        $out = trim((string) $p->getOutput());
-        $v = is_numeric($out) ? (float) $out : 0.0;
-        return max(0.0, $v);
     }
 
     /**
@@ -752,17 +757,23 @@ class DeepgramLiveRelayConnection
         $script = base_path('scripts/embed_audio.py');
         $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
 
-        $p = new Process([$python, $script, '--file', $absolutePath, '--timeout', (string) $timeout]);
-        $p->setTimeout($timeout + 10);
-        $p->setEnv(array_merge($_SERVER, $_ENV, [
-            'PATH' => $this->buildPath(),
-        ]));
-        $p->run();
-
-        if (!$p->isSuccessful()) {
+        try {
+            [$exit, $stdout] = $this->runSubprocess([
+                $python,
+                $script,
+                '--file',
+                $absolutePath,
+                '--timeout',
+                (string) $timeout,
+            ]);
+        } catch (Throwable) {
             return null;
         }
-        $decoded = json_decode((string) $p->getOutput(), true);
+
+        if ($exit !== 0) {
+            return null;
+        }
+        $decoded = json_decode($stdout, true);
         if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
             return null;
         }
@@ -789,6 +800,60 @@ class DeepgramLiveRelayConnection
             $candidates,
         )));
         return implode(':', $parts);
+    }
+
+    /**
+     * Environment for child processes (PATH must include ffmpeg/ffprobe/python).
+     *
+     * @return array<string, string>
+     */
+    private function buildProcessEnvironment(): array
+    {
+        $env = [];
+        foreach (array_merge($_SERVER, $_ENV) as $k => $v) {
+            if (!is_string($k) || $k === '') {
+                continue;
+            }
+            if (is_string($v) || is_int($v) || is_float($v)) {
+                $env[$k] = (string) $v;
+            }
+        }
+        $env['PATH'] = $this->buildPath();
+
+        return $env;
+    }
+
+    /**
+     * Run a subprocess without blocking the WebSocket event loop (Amp + Revolt).
+     *
+     * @param list<string> $command
+     * @return array{0:int,1:string,2:string} exit code, stdout, stderr
+     */
+    private function runSubprocess(array $command): array
+    {
+        $cwd = getcwd();
+        $cwd = $cwd !== false ? $cwd : null;
+
+        $proc = Process::start($command, $cwd, $this->buildProcessEnvironment());
+
+        $stdoutFut = async(function () use ($proc): string {
+            try {
+                return buffer($proc->getStdout());
+            } catch (Throwable) {
+                return '';
+            }
+        });
+        $stderrFut = async(function () use ($proc): string {
+            try {
+                return buffer($proc->getStderr());
+            } catch (Throwable) {
+                return '';
+            }
+        });
+
+        $exitCode = $proc->join();
+
+        return [$exitCode, $stdoutFut->await(), $stderrFut->await()];
     }
 
     /**
@@ -874,7 +939,7 @@ class DeepgramLiveRelayConnection
                         return null;
                     }
 
-                    $p2 = new Process([
+                    [$ffExit, $_ffOut, $ffErr] = $this->runSubprocess([
                         'ffmpeg',
                         '-hide_banner',
                         '-loglevel', 'error',
@@ -887,17 +952,14 @@ class DeepgramLiveRelayConnection
                         '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5',
                         $trimPath,
                     ]);
-                    $p2->setTimeout($timeout + 30);
-                    $p2->setEnv(array_merge($_SERVER, $_ENV, ['PATH' => $this->buildPath()]));
-                    $p2->run();
-                    if (!$p2->isSuccessful()) {
+                    if ($ffExit !== 0) {
                         $this->debugVoice('ffmpeg_trim_failed', [
                             'meeting_id' => $meetingId,
                             'range_start' => $rangeStart,
                             'range_end' => $rangeEnd,
                             'dur' => $dur,
-                            'exit' => $p2->getExitCode(),
-                            'stderr' => trim((string) $p2->getErrorOutput()),
+                            'exit' => $ffExit,
+                            'stderr' => trim($ffErr),
                         ]);
                         return null;
                     }
@@ -1030,7 +1092,8 @@ class DeepgramLiveRelayConnection
             ]);
 
             $this->voiceEmbeddingBusy = true;
-            EventLoop::queue(function () use ($meetingId, $label, $rangeStart, $rangeEnd) {
+            // Fiber + Amp\Process so ffmpeg/python do not freeze WS I/O (Symfony Process::run blocked the loop).
+            async(function () use ($meetingId, $label, $rangeStart, $rangeEnd): void {
                 try {
                     $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
                     if (!is_array($vec) || count($vec) === 0) {
@@ -1040,6 +1103,7 @@ class DeepgramLiveRelayConnection
                             'range_start' => $rangeStart,
                             'range_end' => $rangeEnd,
                         ]);
+
                         return;
                     }
                     $this->accumulateVoiceprint((string) $label, $vec);
@@ -1308,8 +1372,8 @@ class DeepgramLiveRelayConnection
             : $this->connectDeepgram($deepgramKey);
 
         // Coalesce frontend updates on timers (prevents 1006 from browser overload).
-        // User-facing "bar update" cadence is controlled here.
-        $statsIntervalSeconds = (float) (env('MEETING_WS_STATS_INTERVAL_SECONDS', 0.2));
+        // User-facing "bar update" cadence is controlled here (default 100ms ≈ realtime feel).
+        $statsIntervalSeconds = (float) (env('MEETING_WS_STATS_INTERVAL_SECONDS', 0.1));
         $statsIntervalSeconds = max(0.05, min(2.0, $statsIntervalSeconds)); // safety clamp
         $this->statsTimerId = EventLoop::repeat($statsIntervalSeconds, function () use ($frontend, $meetingId) {
             if ($frontend->isClosed()) {
@@ -1402,6 +1466,21 @@ class DeepgramLiveRelayConnection
                             $this->onDeepgramMessage($meetingId, $text);
                         }
                         $now = microtime(true);
+                        // Default off: extra stats pushes compete with audio/STT; timer is enough for smooth bars.
+                        $immediateStatsMin = (float) (env('MEETING_WS_STATS_IMMEDIATE_MIN_SECONDS', 0));
+                        if ($immediateStatsMin > 0.0) {
+                            $immediateStatsMin = max(0.03, min(0.5, $immediateStatsMin));
+                        }
+                        if ($immediateStatsMin > 0.0 && ($now - $this->lastImmediateStatsPushAt) >= $immediateStatsMin) {
+                            try {
+                                $snapshot = $this->buildSnapshot($meetingId);
+                                if ($snapshot && !$frontend->isClosed()) {
+                                    $frontend->sendText(json_encode(['event' => 'stats.updated', 'data' => $snapshot]));
+                                }
+                                $this->lastImmediateStatsPushAt = $now;
+                            } catch (Throwable) {
+                            }
+                        }
                         if ($this->transcriptEnabled && ($now - $this->lastImmediateTranscriptPushAt) >= 0.015) {
                             try {
                                 $this->pushTranscriptUpdate($frontend, $meetingId);
@@ -1517,7 +1596,7 @@ class DeepgramLiveRelayConnection
     private function connectDeepgram(string $apiKey): ClientWebsocketConnection
     {
         $model = (string) (config('services.deepgram.live_model') ?: env('DEEPGRAM_LIVE_MODEL') ?: 'nova-3');
-        $endpointingMs = (int) (env('DEEPGRAM_LIVE_ENDPOINTING_MS', 200));
+        $endpointingMs = (int) (env('DEEPGRAM_LIVE_ENDPOINTING_MS', 120));
         $endpointingMs = max(50, min(2000, $endpointingMs));
 
         $params = [
@@ -2296,6 +2375,41 @@ class DeepgramLiveRelayConnection
     }
 
     /**
+     * Cap attributed talk so it cannot exceed received audio by an implausible margin.
+     * Realtime fill attributes PCM wall-clock to the active label while STT finals also add
+     * diarized durations for the same speech → totals can exceed {@see $audioCursorSeconds}.
+     * Allow extra headroom when overlap (simultaneous speech) is high.
+     */
+    private function clampSpeakerSecondsToPlausibleTimeline(): void
+    {
+        $cursor = max(0.0, (float) $this->audioCursorSeconds);
+        if ($cursor <= 0.0 || count($this->speakerSeconds) === 0) {
+            return;
+        }
+
+        $sum = 0.0;
+        foreach ($this->speakerSeconds as $s) {
+            $sum += max(0.0, (float) $s);
+        }
+        if ($sum <= $cursor) {
+            return;
+        }
+
+        $timeline = max($cursor, max(1e-6, (float) $this->totalSeconds));
+        $overlapRatio = min(1.0, $this->overlapSeconds / $timeline);
+        $maxSum = $cursor * (1.0 + $overlapRatio);
+
+        if ($sum <= $maxSum) {
+            return;
+        }
+
+        $scale = $maxSum / max(1e-9, $sum);
+        foreach ($this->speakerSeconds as $label => $s) {
+            $this->speakerSeconds[$label] = max(0.0, (float) $s) * $scale;
+        }
+    }
+
+    /**
      * Keep talk-time bars responsive while waiting for provider finals.
      */
     private function applyRealtimeActiveSpeakerEstimate(): void
@@ -2338,18 +2452,33 @@ class DeepgramLiveRelayConnection
         $this->totalSeconds = max($this->totalSeconds, $cursor);
     }
 
+    /**
+     * Crosstalk % from in-memory overlap (same formula as persistToDb) so the UI
+     * does not lag behind the 2s DB persist timer.
+     */
+    private function computeLiveCrosstalkPercentage(): float
+    {
+        $timeline = max(1.0, $this->totalSeconds, $this->audioCursorSeconds);
+
+        return (float) round(($this->overlapSeconds / $timeline) * 100, 2);
+    }
+
     private function buildSnapshot(int $meetingId): ?array
     {
-        $analytic = MeetingAnalytic::query()->where('meeting_id', $meetingId)->first();
-
         $this->applyRealtimeActiveSpeakerEstimate();
         $this->reconcileSpeakerSecondsWithAudioClock();
+        // Diarized seconds + realtime "fill" can exceed received PCM (double-count); keep UI sane vs live_audio_seconds.
+        $this->clampSpeakerSecondsToPlausibleTimeline();
 
         // Live WS mode should feel real-time. DB stats store integer seconds (by design),
         // which makes the UI jump/lag. Prefer the in-memory floating seconds when available.
         $liveSeconds = $this->speakerSeconds;
 
         $liveLabels = array_keys($liveSeconds);
+        $analytic = count($liveLabels) === 0
+            ? MeetingAnalytic::query()->where('meeting_id', $meetingId)->first()
+            : null;
+
         if (count($liveLabels) > 0) {
             $this->refreshSpeakerMappingCache($meetingId, array_map(fn ($x) => (string) $x, $liveLabels));
 
@@ -2391,11 +2520,15 @@ class DeepgramLiveRelayConnection
                 ->all();
         }
 
+        $crosstalk = count($liveLabels) > 0
+            ? $this->computeLiveCrosstalkPercentage()
+            : (float) ($analytic?->crosstalk_percentage ?? 0);
+
         return [
             'meeting_id' => $meetingId,
             'total_participants' => count($stats),
             'participants' => $stats,
-            'crosstalk_percentage' => (float) ($analytic?->crosstalk_percentage ?? 0),
+            'crosstalk_percentage' => $crosstalk,
             'live_audio_seconds' => (float) $this->audioCursorSeconds,
             'voice_config' => [
                 'format' => $this->audioFormat,
