@@ -7,7 +7,7 @@ Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
-Artisan::command('deepgram:relay {--host=127.0.0.1} {--port=8081}', function () {
+Artisan::command('deepgram:relay {--host=127.0.0.1} {--port=8082}', function () {
     $host = (string) $this->option('host');
     $port = (int) $this->option('port');
 

@@ -7,6 +7,7 @@ use App\Jobs\ProcessChunkJob;
 use App\Models\MeetingParticipant;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 class IntroChunkController extends Controller
@@ -31,6 +32,15 @@ class IntroChunkController extends Controller
         $sync = filter_var($request->query('sync', false), FILTER_VALIDATE_BOOL);
 
         $filePath = $this->storeChunkFile($request, $id, $chunkIndex);
+        Log::info('intro_chunk_received', [
+            'meeting_id' => $id,
+            'chunk_index' => $chunkIndex,
+            'sync' => (bool) $sync,
+            'duration_seconds' => $durationSeconds,
+            'file_path' => $filePath,
+            'size_bytes' => (int) ($request->file('audio')?->getSize() ?? 0),
+            'ext' => (string) ($request->file('audio')?->getClientOriginalExtension() ?? ''),
+        ]);
 
         if ($sync) {
             $startedAt = now();
@@ -43,6 +53,12 @@ class IntroChunkController extends Controller
                     durationSeconds: $durationSeconds,
                 );
             } catch (\Throwable $e) {
+                Log::warning('intro_chunk_failed', [
+                    'meeting_id' => $id,
+                    'chunk_index' => $chunkIndex,
+                    'sync' => (bool) $sync,
+                    'message' => $e->getMessage(),
+                ]);
                 return response()->json([
                     'status' => 'failed',
                     'error' => $e->getMessage(),

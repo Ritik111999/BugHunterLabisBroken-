@@ -187,8 +187,13 @@ class DeepgramLiveRelayConnection
     private float $maxAudioKeepSeconds = 35.0;
     private int $maxTranscriptCharsPerLabel = 6000;
 
-    /** @var array<string,array{sum:array<int,float>,count:int}> */
-    private array $speakerVoiceprint = [];
+    /**
+     * Rolling speaker embeddings per diarization label (last N embeds).
+     * We average these before matching to stabilize identity for short / noisy segments.
+     *
+     * @var array<string,list<array<int,float>>>
+     */
+    private array $speakerVoiceprintHistory = [];
     /** @var array<string,float> */
     private array $labelLastEmbedAt = [];
 
@@ -201,11 +206,52 @@ class DeepgramLiveRelayConnection
     private array $enrolledVoiceprints = [];
 
     /**
+     * Real enrolled participants (non-placeholder) for this meeting.
+     * Used by the no-diarization fallback to emit stable participant rows even when Deepgram collapses labels.
+     *
+     * @var array<int,string> participant_id => name
+     */
+    private array $enrolledParticipantNamesById = [];
+
+    /**
+     * Fallback attribution when diarization collapses to a single label:
+     * accumulate talk seconds directly per participant_id via rolling voiceprint classification.
+     *
+     * @var array<int,float> participant_id => seconds
+     */
+    private array $fallbackParticipantSeconds = [];
+    private float $fallbackLastAttributionCursor = 0.0;
+    private float $fallbackLastEmbedAt = 0.0;
+    /** @var array<int,float> participant_id => ema_posterior */
+    private array $fallbackPosteriorEma = [];
+    private int $fallbackStablePid = 0;
+    private int $fallbackStableCount = 0;
+
+    /** @var array<string,array<int,float>> label => [participant_id => ema_posterior] */
+    private array $labelPosteriorEma = [];
+    /** @var array<string,int> label => stable_participant_id */
+    private array $labelStablePid = [];
+    /** @var array<string,int> label => stable_count */
+    private array $labelStableCount = [];
+
+    /**
      * Latest per-label voice matching diagnostics (for frontend debug).
      *
      * @var array<string,array{evidence_count:int,best_participant_id:int|null,best_participant_name:string,best_score:float,threshold:float,matched:bool}>
      */
     private array $lastVoiceMatching = [];
+    /**
+     * Last rolling fallback match info (collapsed diarization mode).
+     *
+     * @var array<string,mixed>
+     */
+    private array $lastFallbackMatching = [];
+    /** @var array<int,array<string,mixed>> */
+    private array $lastSttWords = [];
+    private float $lastSttWordsUpdatedAt = 0.0;
+    private float $lastEnrolledReloadAt = 0.0;
+    /** @var array<int,float> participant_id => last_self_enroll_at */
+    private array $selfEnrollLastAtByPid = [];
 
     /**
      * Baselines for attributing "orphan" wall-clock audio (Deepgram lag) without
@@ -292,7 +338,7 @@ class DeepgramLiveRelayConnection
     /**
      * Build transcript lines with participant display names.
      *
-     * @return array<int,array{label:string,name:string,text:string}>
+     * @return array<int,array{label:string,name:string,text:string,participant_id:int|null,confidence:float|null}>
      */
     private function buildTranscriptLines(int $meetingId): array
     {
@@ -315,14 +361,44 @@ class DeepgramLiveRelayConnection
             if ($text === '') {
                 continue;
             }
-            // In-memory detected name is authoritative and instant (no DB lag).
-            $name = $this->speakerDetectedName[$label]['name']
-                ?? (string) ($this->speakerLabelToNameCache[$label] ?? $label);
+
+            // Highest priority: intro detected name (only active during intro).
+            $resolvedPid = null;
+            $confidence = null;
+            $name = $this->speakerDetectedName[$label]['name'] ?? null;
+
+            // Next: live voice matching decision (rolling ECAPA).
+            $vm = $this->lastVoiceMatching[$label] ?? null;
+            if (!$name && is_array($vm) && (bool) ($vm['matched'] ?? false)) {
+                $resolvedPid = is_numeric($vm['best_participant_id'] ?? null) ? (int) $vm['best_participant_id'] : null;
+                $confidence = is_numeric($vm['best_score'] ?? null) ? (float) $vm['best_score'] : null;
+                $name = (string) ($vm['best_participant_name'] ?? '');
+            }
+
+            // If we attempted voice matching but it didn't pass threshold, do NOT force assignment.
+            // In multi-participant meetings this should surface as unknown instead of a sticky wrong name.
+            if (!$name && is_array($vm) && array_key_exists('best_score', $vm) && count($this->enrolledVoiceprints) >= 2) {
+                $confidence = is_numeric($vm['best_score'] ?? null) ? (float) $vm['best_score'] : null;
+                $resolvedPid = null;
+                $name = 'Unknown Speaker';
+            }
+
+            // Fallback: SpeakerMapping cache (DB-driven). (Used mostly for single-speaker / placeholder flows.)
+            if (!$name) {
+                $name = (string) ($this->speakerLabelToNameCache[$label] ?? $label);
+                $resolvedPid = isset($this->speakerLabelToParticipantIdCache[$label]) ? (int) $this->speakerLabelToParticipantIdCache[$label] : null;
+            }
+
+            if (!$name || trim($name) === '') {
+                $name = 'Unknown Speaker';
+            }
 
             $lines[] = [
                 'label' => $label,
                 'name' => $name,
                 'text' => $text,
+                'participant_id' => $resolvedPid,
+                'confidence' => $confidence,
             ];
         }
         return $lines;
@@ -333,13 +409,22 @@ class DeepgramLiveRelayConnection
      */
     private function buildMeetingNlp(int $meetingId): array
     {
-        $labels = array_keys($this->cumulativeSpeakerText);
+        // If the meeting ends before provider finals, cumulativeSpeakerText can be empty
+        // even though we saw interim transcripts. Include live partials so "Meeting insights"
+        // never shows blank when we actually received speech.
+        $labels = array_values(array_unique(array_merge(
+            array_keys($this->cumulativeSpeakerText),
+            array_keys($this->livePartialByLabel)
+        )));
         $this->refreshSpeakerMappingCache($meetingId, array_map(fn ($x) => (string) $x, $labels), true);
 
         $parts = [];
-        foreach ($this->cumulativeSpeakerText as $label => $t) {
+        foreach ($labels as $label) {
             $label = (string) $label;
-            $t = trim((string) $t);
+            $t = trim((string) ($this->cumulativeSpeakerText[$label] ?? ''));
+            if ($t === '') {
+                $t = trim((string) ($this->livePartialByLabel[$label] ?? ''));
+            }
             if ($t === '') {
                 continue;
             }
@@ -420,11 +505,204 @@ class DeepgramLiveRelayConnection
             ->get(['id', 'name', 'voice_embedding']);
 
         foreach ($participants as $p) {
-            $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
-            // Only preload participants enrolled via intro (HTTP path).
-            if (in_array($ve['type'] ?? '', ['intro_name_enrollment'], true)) {
-                $this->enrolledParticipants[strtolower((string) $p->name)] = (int) $p->id;
+            $name = trim((string) $p->name);
+            if ($name === '') {
+                continue;
             }
+            // Index ALL real enrolled participants so live "my name is X" can bind labels
+            // even if voiceprint matching is weak on some devices.
+            if ($this->isPlaceholderName($name)) {
+                continue;
+            }
+            $this->enrolledParticipants[strtolower($name)] = (int) $p->id;
+        }
+    }
+
+    /**
+     * The relay loads enrolled voiceprints once on startup, but intro enrollment can happen
+     * while the relay is already running. Periodically reload enrollment so newly-enrolled
+     * participants become matchable without restarting the relay.
+     */
+    private function maybeReloadEnrolledState(int $meetingId): void
+    {
+        $now = microtime(true);
+        $every = (float) env('MEETING_WS_ENROLLED_REFRESH_SECONDS', 2.0);
+        $every = max(0.5, min(30.0, $every));
+
+        // Always reload when we have <2 voiceprints (can't do multi-speaker matching),
+        // otherwise reload on a slower cadence.
+        $needs = count($this->enrolledVoiceprints) < 2;
+        if (!$needs && $this->lastEnrolledReloadAt > 0.0 && ($now - $this->lastEnrolledReloadAt) < $every) {
+            return;
+        }
+        if ($needs && $this->lastEnrolledReloadAt > 0.0 && ($now - $this->lastEnrolledReloadAt) < 0.5) {
+            return;
+        }
+
+        $this->lastEnrolledReloadAt = $now;
+        try {
+            $this->loadEnrolledParticipants($meetingId);
+            $this->loadEnrolledVoiceprints($meetingId);
+            $this->loadEnrolledParticipantIndex($meetingId);
+        } catch (Throwable) {
+        }
+    }
+
+    /**
+     * No-extra-steps robustness: when the transcript contains "my name is X" (and X is an enrolled participant),
+     * capture the last ~2s of audio, compute an embedding, and attach it as an additional template for that participant.
+     *
+     * This helps when diarization collapses and one participant has a weak / corrupted template.
+     */
+    private function maybeSelfEnrollFromDetectedNames(int $meetingId): void
+    {
+        // Keep this behavior gated to debug mode so we can safely iterate.
+        if (!$this->voiceDebug) {
+            return;
+        }
+        if (count($this->speakerDetectedName) === 0) {
+            return;
+        }
+        if (count($this->enrolledParticipants) === 0) {
+            return;
+        }
+
+        $now = microtime(true);
+        $cooldown = (float) env('MEETING_WS_SELF_ENROLL_COOLDOWN_SECONDS', 6.0);
+        $cooldown = max(1.0, min(60.0, $cooldown));
+
+        foreach ($this->speakerDetectedName as $label => $d) {
+            $name = trim((string) ($d['name'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $pid = (int) ($this->enrolledParticipants[strtolower($name)] ?? 0);
+            if ($pid <= 0) {
+                continue;
+            }
+            $lastAt = (float) ($this->selfEnrollLastAtByPid[$pid] ?? 0.0);
+            if ($lastAt > 0.0 && ($now - $lastAt) < $cooldown) {
+                continue;
+            }
+
+            // Capture a short window ending "now" (audio cursor).
+            $cur = max(0.0, (float) $this->audioCursorSeconds);
+            if ($cur <= 0.25) {
+                continue;
+            }
+            $win = (float) env('MEETING_WS_SELF_ENROLL_WINDOW_SECONDS', 2.0);
+            $win = max(0.8, min(4.0, $win));
+            $rangeEnd = $cur;
+            $rangeStart = max(0.0, $rangeEnd - $win);
+
+            // Single-flight with existing embed busy flag.
+            if ($this->voiceEmbeddingBusy) {
+                continue;
+            }
+
+            $this->selfEnrollLastAtByPid[$pid] = $now;
+            $this->voiceEmbeddingBusy = true;
+
+            async(function () use ($meetingId, $pid, $name, $label, $rangeStart, $rangeEnd): void {
+                try {
+                    $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
+                    if (!is_array($vec) || count($vec) < 32) {
+                        Log::info('relay_self_enroll_voiceprint_empty', [
+                            'meeting_id' => $meetingId,
+                            'participant_id' => $pid,
+                            'name' => $name,
+                            'label' => (string) $label,
+                            'range_start' => $rangeStart,
+                            'range_end' => $rangeEnd,
+                        ]);
+                        return;
+                    }
+
+                    // Prevent corrupting enrollment: reject if too similar to another participant.
+                    $dupThr = (float) env('MEETING_WS_SELF_ENROLL_DUPLICATE_SIM', 0.985);
+                    $dupThr = max(0.85, min(0.999, $dupThr));
+
+                    $others = MeetingParticipant::query()
+                        ->where('meeting_id', $meetingId)
+                        ->whereNotNull('voice_embedding')
+                        ->get(['id', 'name', 'voice_embedding']);
+
+                    foreach ($others as $op) {
+                        if ((int) $op->id === (int) $pid) {
+                            continue;
+                        }
+                        $ove = is_array($op->voice_embedding) ? $op->voice_embedding : [];
+                        $ovp = $ove['voiceprint'] ?? null;
+                        if (!is_array($ovp) || count($ovp) < 32) {
+                            continue;
+                        }
+                        $sim = $this->cosineSimilarity($vec, array_map('floatval', $ovp));
+                        if ($sim >= $dupThr) {
+                            Log::warning('relay_self_enroll_duplicate_suspected', [
+                                'meeting_id' => $meetingId,
+                                'participant_id' => $pid,
+                                'name' => $name,
+                                'label' => (string) $label,
+                                'similarity' => $sim,
+                                'threshold' => $dupThr,
+                                'conflicts_with_participant_id' => (int) $op->id,
+                                'conflicts_with_name' => (string) ($op->name ?? ''),
+                            ]);
+                            return;
+                        }
+                    }
+
+                    DB::transaction(function () use ($pid, $vec): void {
+                        $p = MeetingParticipant::query()->whereKey($pid)->lockForUpdate()->first();
+                        if (!$p) {
+                            return;
+                        }
+                        $prev = is_array($p->voice_embedding) ? $p->voice_embedding : [];
+                        $voiceprints = [];
+                        $existingList = $prev['voiceprints'] ?? null;
+                        if (is_array($existingList)) {
+                            foreach ($existingList as $v) {
+                                if (is_array($v) && count($v) >= 32) {
+                                    $voiceprints[] = array_map('floatval', $v);
+                                }
+                            }
+                        }
+                        $existingVp = $prev['voiceprint'] ?? null;
+                        if (is_array($existingVp) && count($existingVp) >= 32) {
+                            $voiceprints[] = array_map('floatval', $existingVp);
+                        }
+                        $voiceprints[] = array_map('floatval', $vec);
+
+                        $max = (int) env('MEETING_INTRO_MAX_VOICEPRINTS_PER_PERSON', 5);
+                        $max = max(1, min(10, $max));
+                        if (count($voiceprints) > $max) {
+                            $voiceprints = array_slice($voiceprints, -1 * $max);
+                        }
+
+                        if (!is_array($prev['voiceprint'] ?? null) || count((array) ($prev['voiceprint'] ?? [])) < 32) {
+                            $prev['voiceprint'] = $voiceprints[count($voiceprints) - 1];
+                        }
+                        $prev['voiceprint_dim'] = is_array($prev['voiceprint'] ?? null) ? count((array) $prev['voiceprint']) : 0;
+                        $prev['voiceprints'] = $voiceprints;
+
+                        $p->update(['voice_embedding' => $prev]);
+                    });
+
+                    Log::info('relay_self_enroll_voiceprint_ok', [
+                        'meeting_id' => $meetingId,
+                        'participant_id' => $pid,
+                        'name' => $name,
+                        'label' => (string) $label,
+                        'range_start' => $rangeStart,
+                        'range_end' => $rangeEnd,
+                        'dim' => count($vec),
+                    ]);
+                } finally {
+                    $this->voiceEmbeddingBusy = false;
+                }
+            });
+            // Only self-enroll one participant per tick.
+            break;
         }
     }
 
@@ -435,28 +713,139 @@ class DeepgramLiveRelayConnection
             ->whereNotNull('voice_embedding')
             ->get(['id', 'voice_embedding']);
 
-        $out = [];
+        $expectedDim = (int) env('MEETING_VOICEPRINT_EXPECTED_DIM', 192);
+        $expectedDim = max(32, min(2048, $expectedDim));
+
+        // Build ONE averaged template per participant for fair matching.
+        // Otherwise a participant with more templates can dominate scoring simply by having more draws.
+        $byPid = [];
         foreach ($participants as $p) {
             $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
-            $vec = $ve['voiceprint'] ?? null;
-            if (!is_array($vec) || count($vec) < 32) {
-                continue;
-            }
-            $floats = [];
-            foreach ($vec as $v) {
-                if (is_numeric($v)) {
-                    $floats[] = (float) $v;
+            $engine = strtolower(trim((string) ($ve['voiceprint_engine'] ?? $ve['engine'] ?? '')));
+            $candidates = [];
+            if (is_array($ve['voiceprints'] ?? null)) {
+                foreach ($ve['voiceprints'] as $v) {
+                    if (is_array($v) && count($v) >= 32) {
+                        $candidates[] = $v;
+                    }
                 }
             }
-            if (count($floats) < 32) {
+            if (is_array($ve['voiceprint'] ?? null) && count($ve['voiceprint']) >= 32) {
+                $candidates[] = $ve['voiceprint'];
+            }
+
+            foreach ($candidates as $vec) {
+                $floats = [];
+                foreach ($vec as $v) {
+                    if (is_numeric($v)) {
+                        $floats[] = (float) $v;
+                    }
+                }
+                $dim = count($floats);
+                if ($dim < 32) {
+                    continue;
+                }
+                // Only match against ECAPA voiceprints (prevents mixing old Resemblyzer templates).
+                // If engine isn't stored (legacy rows), fall back to expected dimension check.
+                if ($engine !== '' && $engine !== 'speechbrain_ecapa') {
+                    continue;
+                }
+                if ($engine === '' && $expectedDim > 0 && $dim !== $expectedDim) {
+                    continue;
+                }
+                $pid = (int) $p->id;
+                if ($pid > 0) {
+                    $byPid[$pid] = $byPid[$pid] ?? [];
+                    $byPid[$pid][] = $floats;
+                }
+            }
+        }
+
+        $out = [];
+        foreach ($byPid as $pid => $vectors) {
+            if (!is_array($vectors) || count($vectors) === 0) {
                 continue;
             }
+            $n = count($vectors);
+            $dim = count($vectors[0]);
+            if ($dim < 32) {
+                continue;
+            }
+            $sum = array_fill(0, $dim, 0.0);
+            foreach ($vectors as $vec) {
+                $d = min($dim, count($vec));
+                for ($i = 0; $i < $d; $i++) {
+                    $sum[$i] += (float) $vec[$i];
+                }
+            }
+            $avg = [];
+            for ($i = 0; $i < $dim; $i++) {
+                $avg[$i] = $sum[$i] / max(1, $n);
+            }
+            // L2 normalize for cosine stability.
+            $norm = 0.0;
+            for ($i = 0; $i < $dim; $i++) {
+                $norm += $avg[$i] * $avg[$i];
+            }
+            $norm = sqrt(max(1e-12, $norm));
+            for ($i = 0; $i < $dim; $i++) {
+                $avg[$i] = $avg[$i] / $norm;
+            }
             $out[] = [
-                'participant_id' => (int) $p->id,
-                'vector' => $floats,
+                'participant_id' => (int) $pid,
+                'vector' => $avg,
+                'template_count' => (int) $n,
             ];
         }
         $this->enrolledVoiceprints = $out;
+
+        $counts = [];
+        foreach ($out as $e) {
+            $counts[(int) $e['participant_id']] = (int) ($e['template_count'] ?? 1);
+        }
+        $this->debugVoice('enrolled_voiceprints_loaded', [
+            'meeting_id' => $meetingId,
+            'participant_count' => count($counts),
+            'template_counts' => $counts,
+        ]);
+    }
+
+    private function loadEnrolledParticipantIndex(int $meetingId): void
+    {
+        $rows = MeetingParticipant::query()
+            ->where('meeting_id', $meetingId)
+            ->get(['id', 'name']);
+
+        $out = [];
+        foreach ($rows as $p) {
+            $name = (string) ($p->name ?? '');
+            if ($name === '' || $this->isPlaceholderName($name)) {
+                continue;
+            }
+            $out[(int) $p->id] = $name;
+        }
+        $this->enrolledParticipantNamesById = $out;
+    }
+
+    private function isPlaceholderName(string $name): bool
+    {
+        return (bool) preg_match('/^(Speaker\s+\d+|speaker_\d+|chunk\d+_\S+)$/i', trim($name));
+    }
+
+    /**
+     * Treat diarization as "collapsed" if we have <=1 concrete speaker label (excluding speaker_unknown).
+     */
+    private function concreteDiarizedLabelCount(): int
+    {
+        $n = 0;
+        foreach (array_keys($this->speakerSeconds) as $label) {
+            $label = (string) $label;
+            if ($label === '' || $label === 'speaker_unknown') {
+                continue;
+            }
+            $n++;
+        }
+        return $n;
     }
 
     /**
@@ -528,6 +917,23 @@ class DeepgramLiveRelayConnection
         $end = $start + $dur;
         $this->audioCursorSeconds = $end;
 
+        // Lightweight VAD so we can start voice attribution immediately, even before STT emits words/utterances.
+        // Deepgram diarization can lag or collapse to one label in mono streams; this keeps "recent speech" hot.
+        $vadThr = (float) env('MEETING_PCM_VAD_THRESHOLD', 900.0);
+        $vadThr = max(50.0, min(8000.0, $vadThr));
+        // Mobile PCM amplitudes can be much lower than browser recordings.
+        // If we have enrolled voiceprints, cap the threshold so speech is detected promptly.
+        if (count($this->enrolledVoiceprints) >= 1) {
+            $vadThr = min($vadThr, 300.0);
+        }
+        $energy = $this->pcmAvgAbs16($bytes);
+        if ($energy >= $vadThr) {
+            $this->lastActiveSpeakerAt = microtime(true);
+            if ($this->activeSpeakerLabel === '') {
+                $this->activeSpeakerLabel = 'speaker_0';
+            }
+        }
+
         $chunk = [
             'start' => $start,
             'end' => $end,
@@ -541,7 +947,41 @@ class DeepgramLiveRelayConnection
         $this->audioChunks[] = $chunk;
         $this->pruneAudioBuffers();
 
+        // Kick fallback attribution promptly on speech (otherwise we wait for the embed timer tick).
+        if (!$this->voiceEmbeddingBusy) {
+            try {
+                $this->maybeAttributeWithoutDiarization($meetingId);
+            } catch (Throwable) {
+            }
+        }
+
         return $chunk;
+    }
+
+    /**
+     * Average absolute amplitude of PCM16LE mono chunk (quick VAD signal).
+     */
+    private function pcmAvgAbs16(string $bytes): float
+    {
+        $n = intdiv(strlen($bytes), 2);
+        if ($n <= 0) {
+            return 0.0;
+        }
+        $sum = 0.0;
+        // Sample at most ~800 values for speed (stride).
+        $stride = max(1, (int) floor($n / 800));
+        $count = 0;
+        for ($i = 0; $i < $n; $i += $stride) {
+            $lo = ord($bytes[$i * 2]);
+            $hi = ord($bytes[$i * 2 + 1]);
+            $v = ($hi << 8) | $lo;
+            if ($v >= 0x8000) {
+                $v -= 0x10000;
+            }
+            $sum += abs((int) $v);
+            $count++;
+        }
+        return $count > 0 ? ($sum / $count) : 0.0;
     }
 
     private function pruneAudioBuffers(): void
@@ -756,25 +1196,42 @@ class DeepgramLiveRelayConnection
         $python = (string) config('meeting_analytics.analyzer.python', 'python3');
         $script = base_path('scripts/embed_audio.py');
         $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
+        $maxSeconds = (float) env('MEETING_WS_EMBED_MAX_SECONDS', 6.0);
+        $maxSeconds = max(1.0, min(60.0, $maxSeconds));
 
         try {
-            [$exit, $stdout] = $this->runSubprocess([
+            [$exit, $stdout, $stderr] = $this->runSubprocess([
                 $python,
                 $script,
                 '--file',
                 $absolutePath,
                 '--timeout',
                 (string) $timeout,
+                '--max-seconds',
+                (string) $maxSeconds,
             ]);
         } catch (Throwable) {
             return null;
         }
 
         if ($exit !== 0) {
+            // Keep diagnostics in logs while ensuring JSON parsing stays strict.
+            $decoded = json_decode($stdout, true);
+            $this->debugVoice('embed_subprocess_failed', [
+                'exit' => $exit,
+                'stdout' => trim($stdout),
+                'stderr' => trim((string) $stderr),
+                'error' => is_array($decoded) ? ($decoded['error'] ?? null) : null,
+            ]);
             return null;
         }
         $decoded = json_decode($stdout, true);
         if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
+            $this->debugVoice('embed_invalid_json', [
+                'stdout' => trim($stdout),
+                'stderr' => trim((string) $stderr),
+                'decoded_error' => is_array($decoded) ? ($decoded['error'] ?? null) : null,
+            ]);
             return null;
         }
         $vec = [];
@@ -851,7 +1308,59 @@ class DeepgramLiveRelayConnection
             }
         });
 
-        $exitCode = $proc->join();
+        // IMPORTANT: keep the WS loop responsive.
+        // When voice matching is active (2+ participants), we spawn ffmpeg/python often.
+        // If a subprocess hangs, it must not stall the event loop.
+        $timeoutSeconds = (float) env('MEETING_WS_SUBPROCESS_TIMEOUT_SECONDS', 8.0);
+        $timeoutSeconds = max(1.0, min(60.0, $timeoutSeconds));
+
+        // Wait for join() or timeout without blocking the loop.
+        $suspension = EventLoop::getSuspension();
+        $done = false;
+        $resumed = false;
+        $exitCode = 124; // timeout default
+        $resumeOnce = static function (bool $value) use (&$resumed, $suspension): void {
+            if ($resumed) {
+                return;
+            }
+            $resumed = true;
+            try {
+                $suspension->resume($value);
+            } catch (Throwable) {
+            }
+        };
+
+        $timerId = EventLoop::delay($timeoutSeconds, static function () use (&$done, $resumeOnce): void {
+            if ($done) {
+                return;
+            }
+            $resumeOnce(false);
+        });
+
+        async(function () use ($proc, &$done, &$exitCode, $resumeOnce, $timerId): void {
+            try {
+                $join = $proc->join();
+                // amphp/process v2: join() returns Future<int>.
+                if ($join instanceof \Amp\Future) {
+                    $exitCode = (int) $join->await();
+                } else {
+                    $exitCode = (int) $join;
+                }
+            } catch (Throwable) {
+                $exitCode = 125;
+            } finally {
+                $done = true;
+                try { EventLoop::cancel($timerId); } catch (Throwable) {}
+                $resumeOnce(true);
+            }
+        });
+
+        $ok = (bool) $suspension->suspend();
+        if (!$ok) {
+            // Timeout hit.
+            try { $proc->signal(\SIGKILL); } catch (Throwable) {}
+            $exitCode = 124;
+        }
 
         return [$exitCode, $stdoutFut->await(), $stderrFut->await()];
     }
@@ -867,7 +1376,10 @@ class DeepgramLiveRelayConnection
         $rangeStart = max(0.0, $rangeStart);
         $rangeEnd = max($rangeStart, $rangeEnd);
         $dur = $rangeEnd - $rangeStart;
-        if ($dur < 0.8) {
+        // Lower default improves "instant" recognition on mobile.
+        $minEmbedSeconds = (float) env('MEETING_WS_MIN_EMBED_SECONDS', 0.45);
+        $minEmbedSeconds = max(0.25, min(2.0, $minEmbedSeconds));
+        if ($dur < $minEmbedSeconds) {
             return null;
         }
 
@@ -1041,14 +1553,43 @@ class DeepgramLiveRelayConnection
             }
         }
 
+        // Single-flight: we only spawn one embedding subprocess at a time,
+        // but we should not starve "new" labels (e.g. speaker_1) behind a dominant label (speaker_0).
+        // Prioritize labels that don't have a voiceprint yet, then by most speech.
+        $labels = array_keys($speechByLabel);
+        usort($labels, function (string $a, string $b) use ($speechByLabel): int {
+            $ha = is_array($this->speakerVoiceprintHistory[$a] ?? null) ? count($this->speakerVoiceprintHistory[$a]) : 0;
+            $hb = is_array($this->speakerVoiceprintHistory[$b] ?? null) ? count($this->speakerVoiceprintHistory[$b]) : 0;
+            $na = $ha <= 0 ? 1 : 0;
+            $nb = $hb <= 0 ? 1 : 0;
+            if ($na !== $nb) {
+                // "new" labels first
+                return $nb <=> $na;
+            }
+            $sa = (float) ($speechByLabel[$a] ?? 0.0);
+            $sb = (float) ($speechByLabel[$b] ?? 0.0);
+            return $sb <=> $sa;
+        });
+
         $now = microtime(true);
-        foreach ($speechByLabel as $label => $speechSeconds) {
-            if ((float) $speechSeconds < $this->labelMinSpeechSeconds) {
+        $bootstrapMinSpeech = (float) env('MEETING_WS_LABEL_BOOTSTRAP_MIN_SPEECH_SECONDS', 0.25);
+        $bootstrapMinSpeech = max(0.12, min(1.0, $bootstrapMinSpeech));
+
+        foreach ($labels as $label) {
+            $speechSeconds = (float) ($speechByLabel[$label] ?? 0.0);
+            $histCount = is_array($this->speakerVoiceprintHistory[(string) $label] ?? null)
+                ? count($this->speakerVoiceprintHistory[(string) $label])
+                : 0;
+            $effectiveMinSpeech = $histCount <= 0
+                ? min($this->labelMinSpeechSeconds, $bootstrapMinSpeech)
+                : $this->labelMinSpeechSeconds;
+
+            if ($speechSeconds < $effectiveMinSpeech) {
                 $this->debugVoice('label_insufficient_speech', [
                     'meeting_id' => $meetingId,
                     'label' => $label,
                     'speech_seconds' => (float) $speechSeconds,
-                    'min_speech_seconds' => $this->labelMinSpeechSeconds,
+                    'min_speech_seconds' => $effectiveMinSpeech,
                     'window_seconds' => $this->labelWindowSeconds,
                 ]);
                 continue;
@@ -1107,10 +1648,13 @@ class DeepgramLiveRelayConnection
                         return;
                     }
                     $this->accumulateVoiceprint((string) $label, $vec);
+                    $histCount = is_array($this->speakerVoiceprintHistory[(string) $label] ?? null)
+                        ? count($this->speakerVoiceprintHistory[(string) $label])
+                        : 0;
                     $this->debugVoice('label_embed_accumulated', [
                         'meeting_id' => $meetingId,
                         'label' => $label,
-                        'count' => (int) (($this->speakerVoiceprint[(string) $label]['count'] ?? 0)),
+                        'count' => (int) $histCount,
                     ]);
                 } finally {
                     $this->voiceEmbeddingBusy = false;
@@ -1119,6 +1663,177 @@ class DeepgramLiveRelayConnection
             // Single-flight: one embed job per timer tick.
             break;
         }
+    }
+
+    /**
+     * When live diarization collapses multiple people into a single speaker label (common with mono streams),
+     * attribute talk-time directly to enrolled participants using a rolling voiceprint classification window.
+     *
+     * This scales to 5+ participants: each window embedding is matched against all enrolled voiceprints.
+     */
+    private function maybeAttributeWithoutDiarization(int $meetingId): void
+    {
+        $this->maybeReloadEnrolledState($meetingId);
+        if (count($this->enrolledVoiceprints) < 2) {
+            return;
+        }
+        if ($this->concreteDiarizedLabelCount() > 1) {
+            return;
+        }
+
+        $now = microtime(true);
+        // Cooldown: avoid spawning embedding processes too frequently.
+        // For multi-participant meetings, keep it fast so switching speakers is detected quickly.
+        $cooldown = count($this->enrolledVoiceprints) >= 2 ? 0.20 : 0.55;
+        if ($this->fallbackLastEmbedAt > 0.0 && ($now - $this->fallbackLastEmbedAt) < $cooldown) {
+            return;
+        }
+        $recentSpeech = $this->lastActiveSpeakerAt > 0.0 && ($now - $this->lastActiveSpeakerAt) <= 0.8;
+        $cur = max(0.0, (float) $this->audioCursorSeconds);
+        if (!$recentSpeech) {
+            $this->fallbackLastAttributionCursor = max($this->fallbackLastAttributionCursor, $cur);
+            return;
+        }
+
+        if ($this->fallbackLastAttributionCursor <= 0.0) {
+            $this->fallbackLastAttributionCursor = $cur;
+            return;
+        }
+
+        $delta = $cur - $this->fallbackLastAttributionCursor;
+        if ($delta <= 0.02) {
+            return;
+        }
+        if ($delta > 1.25) {
+            // Don't backfill large gaps (reconnect / pause).
+            $this->fallbackLastAttributionCursor = $cur;
+            return;
+        }
+
+        $rangeEnd = $cur;
+        // Use a shorter window for "current speaker" classification.
+        // If the window is too long, it contains both speakers and keeps matching the dominant one.
+        // Rolling window classification (seconds). 1.0s is a good balance:
+        // enough phonetic content to be stable, short enough to switch quickly.
+        $fallbackWindow = (float) env('MEETING_WS_FALLBACK_WINDOW_SECONDS', 1.0);
+        $fallbackWindow = max(0.35, min(4.0, $fallbackWindow));
+        $window = min($this->labelWindowSeconds, $fallbackWindow);
+        $rangeStart = max(0.0, $rangeEnd - $window);
+
+        $this->fallbackLastEmbedAt = $now;
+        $this->voiceEmbeddingBusy = true;
+        async(function () use ($meetingId, $rangeStart, $rangeEnd, $delta): void {
+            try {
+                $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
+                if (!is_array($vec) || count($vec) === 0) {
+                    $this->debugVoice('fallback_embed_empty', [
+                        'meeting_id' => $meetingId,
+                        'range_start' => $rangeStart,
+                        'range_end' => $rangeEnd,
+                    ]);
+                    return;
+                }
+
+                // Stabilize fallback classification using rolling-average embeddings (reduces ties).
+                $this->accumulateVoiceprint('__fallback__', $vec);
+                $avg = $this->getVoiceprintForLabel('__fallback__');
+                $useVec = is_array($avg) && is_array($avg['vec'] ?? null) ? (array) $avg['vec'] : $vec;
+
+                $scored = $this->scoreAllParticipants($useVec);
+                $scores = (array) ($scored['scores'] ?? []);
+                $posterior = (array) ($scored['posterior'] ?? []);
+                $sum = $this->posteriorSummary($posterior);
+
+                // Temporal smoothing: EMA over posteriors to reduce frame-level ties/noise.
+                $alpha = (float) env('MEETING_VOICEPRINT_POSTERIOR_EMA_ALPHA', 0.35);
+                $alpha = max(0.05, min(0.95, $alpha));
+                $ema = $this->fallbackPosteriorEma;
+                foreach ($posterior as $pid => $p) {
+                    $pid = (int) $pid;
+                    $prev = (float) ($ema[$pid] ?? 0.0);
+                    $ema[$pid] = ($alpha * (float) $p) + ((1.0 - $alpha) * $prev);
+                }
+                // Light decay for participants not present in this frame.
+                foreach ($ema as $pid => $p) {
+                    if (!array_key_exists((int) $pid, $posterior)) {
+                        $ema[(int) $pid] = (float) ($p * (1.0 - ($alpha * 0.20)));
+                    }
+                }
+                arsort($ema);
+                $emaTopPid = count($ema) ? (int) array_key_first($ema) : 0;
+                $emaVals = array_values($ema);
+                $emaTopP = (float) ($emaVals[0] ?? 0.0);
+                $emaSecondP = (float) ($emaVals[1] ?? 0.0);
+                $this->fallbackPosteriorEma = $ema;
+
+                // Stability gate: require sustained evidence before switching attribution.
+                $minAssignP = (float) env('MEETING_VOICEPRINT_FALLBACK_MIN_POSTERIOR', 0.52);
+                $minAssignP = max(0.25, min(0.95, $minAssignP));
+                $switchGap = (float) env('MEETING_VOICEPRINT_FALLBACK_MIN_POSTERIOR_GAP', 0.03);
+                $switchGap = max(0.0, min(0.5, $switchGap));
+                $stableWindows = (int) env('MEETING_VOICEPRINT_FALLBACK_STABLE_WINDOWS', 2);
+                $stableWindows = max(1, min(10, $stableWindows));
+
+                if ($emaTopPid !== $this->fallbackStablePid) {
+                    // Only allow switch if the new winner is meaningfully ahead.
+                    if ($emaTopPid > 0 && $emaTopP >= $minAssignP && (($emaTopP - $emaSecondP) >= $switchGap)) {
+                        $this->fallbackStablePid = $emaTopPid;
+                        $this->fallbackStableCount = 1;
+                    } else {
+                        // Don't switch; keep previous stable pid (if any).
+                        $this->fallbackStableCount = 0;
+                    }
+                } else {
+                    $this->fallbackStableCount++;
+                }
+
+                $pid = $this->fallbackStablePid > 0 && $this->fallbackStableCount >= $stableWindows
+                    ? (int) $this->fallbackStablePid
+                    : 0;
+
+                $this->lastFallbackMatching = [
+                    'best_participant_id' => $sum['pid'],
+                    'best_score' => (float) (array_values($scores)[0] ?? -1.0),
+                    'second_best_score' => (float) (array_values($scores)[1] ?? -1.0),
+                    'top_scores' => array_slice($scores, 0, 6, true),
+                    'top_posteriors' => array_slice($posterior, 0, 6, true),
+                    'ema_top_pid' => $emaTopPid,
+                    'ema_top_p' => $emaTopP,
+                    'ema_second_p' => $emaSecondP,
+                    'stable_pid' => $this->fallbackStablePid,
+                    'stable_count' => $this->fallbackStableCount,
+                    'min_p' => $minAssignP,
+                    'min_gap' => $switchGap,
+                    'stable_windows' => $stableWindows,
+                    'entropy' => (float) $sum['entropy'],
+                ];
+                $this->debugVoice('fallback_score', $this->lastFallbackMatching);
+
+                if ($pid <= 0) {
+                    $this->debugVoice('fallback_no_match', [
+                        'meeting_id' => $meetingId,
+                        'range_start' => $rangeStart,
+                        'range_end' => $rangeEnd,
+                        '_fallback_last' => $this->lastFallbackMatching,
+                    ]);
+                    return;
+                }
+
+                $this->fallbackParticipantSeconds[$pid] = ($this->fallbackParticipantSeconds[$pid] ?? 0.0) + (float) $delta;
+                $this->debugVoice('fallback_attributed', [
+                    'meeting_id' => $meetingId,
+                    'participant_id' => $pid,
+                    'score' => (float) $emaTopP,
+                    'delta' => (float) $delta,
+                    'range_start' => $rangeStart,
+                    'range_end' => $rangeEnd,
+                ]);
+            } finally {
+                $this->voiceEmbeddingBusy = false;
+            }
+        });
+
+        $this->fallbackLastAttributionCursor = $cur;
     }
 
     /**
@@ -1168,16 +1883,16 @@ class DeepgramLiveRelayConnection
      */
     private function accumulateVoiceprint(string $label, array $vec): void
     {
-        if (!isset($this->speakerVoiceprint[$label])) {
-            $this->speakerVoiceprint[$label] = ['sum' => array_fill(0, count($vec), 0.0), 'count' => 0];
+        $max = (int) env('MEETING_WS_ROLLING_EMBED_COUNT', 5);
+        $max = max(1, min(10, $max));
+
+        if (!isset($this->speakerVoiceprintHistory[$label])) {
+            $this->speakerVoiceprintHistory[$label] = [];
         }
-        $sum = $this->speakerVoiceprint[$label]['sum'];
-        $n = min(count($sum), count($vec));
-        for ($i = 0; $i < $n; $i++) {
-            $sum[$i] += (float) $vec[$i];
+        $this->speakerVoiceprintHistory[$label][] = array_map('floatval', $vec);
+        if (count($this->speakerVoiceprintHistory[$label]) > $max) {
+            $this->speakerVoiceprintHistory[$label] = array_slice($this->speakerVoiceprintHistory[$label], -1 * $max);
         }
-        $this->speakerVoiceprint[$label]['sum'] = $sum;
-        $this->speakerVoiceprint[$label]['count']++;
     }
 
     /**
@@ -1185,15 +1900,27 @@ class DeepgramLiveRelayConnection
      */
     private function getVoiceprintForLabel(string $label): ?array
     {
-        $acc = $this->speakerVoiceprint[$label] ?? null;
-        if (!$acc || ($acc['count'] ?? 0) < 1) {
+        $hist = $this->speakerVoiceprintHistory[$label] ?? null;
+        if (!is_array($hist) || count($hist) < 1) {
             return null;
         }
-        $sum = $acc['sum'];
-        $count = max(1, (int) $acc['count']);
+
+        // Average last N embeddings.
+        $count = count($hist);
+        $dim = count($hist[$count - 1] ?? []);
+        if ($dim < 32) {
+            return null;
+        }
+        $sum = array_fill(0, $dim, 0.0);
+        foreach ($hist as $vec) {
+            $n = min($dim, count($vec));
+            for ($i = 0; $i < $n; $i++) {
+                $sum[$i] += (float) $vec[$i];
+            }
+        }
         $avg = [];
-        foreach ($sum as $v) {
-            $avg[] = (float) $v / $count;
+        for ($i = 0; $i < $dim; $i++) {
+            $avg[] = (float) $sum[$i] / max(1, $count);
         }
         // normalize
         $norm = 0.0;
@@ -1234,6 +1961,101 @@ class DeepgramLiveRelayConnection
     }
 
     /**
+     * @param array<int,float> $scores participant_id => cosine score
+     * @return array<int,float> participant_id => probability (sums to ~1)
+     */
+    private function softmaxPosteriors(array $scores): array
+    {
+        if (count($scores) === 0) {
+            return [];
+        }
+        // Temperature: lower = sharper (more confident), higher = flatter (more cautious).
+        $temp = (float) env('MEETING_VOICEPRINT_SOFTMAX_TEMP', 0.07);
+        $temp = max(0.01, min(1.0, $temp));
+
+        $max = max($scores);
+        $exps = [];
+        $sum = 0.0;
+        foreach ($scores as $pid => $s) {
+            $x = ((float) $s - (float) $max) / $temp;
+            // Avoid overflow in exp.
+            $x = max(-60.0, min(60.0, $x));
+            $e = exp($x);
+            $exps[(int) $pid] = $e;
+            $sum += $e;
+        }
+        $sum = max(1e-12, $sum);
+        $out = [];
+        foreach ($exps as $pid => $e) {
+            $out[(int) $pid] = (float) ($e / $sum);
+        }
+        arsort($out);
+        return $out;
+    }
+
+    /**
+     * @param array<int,float> $posterior participant_id => probability
+     * @return array{pid:int,p:float,second_p:float,entropy:float}
+     */
+    private function posteriorSummary(array $posterior): array
+    {
+        if (count($posterior) === 0) {
+            return ['pid' => 0, 'p' => 0.0, 'second_p' => 0.0, 'entropy' => 0.0];
+        }
+        $pid = (int) array_key_first($posterior);
+        $vals = array_values($posterior);
+        $p1 = (float) ($vals[0] ?? 0.0);
+        $p2 = (float) ($vals[1] ?? 0.0);
+        $h = 0.0;
+        foreach ($posterior as $p) {
+            $pp = max(1e-12, (float) $p);
+            $h += -1.0 * $pp * log($pp);
+        }
+        return ['pid' => $pid, 'p' => $p1, 'second_p' => $p2, 'entropy' => $h];
+    }
+
+    /**
+     * @param array<int,float> $vec
+     * @return array{scores:array<int,float>,posterior:array<int,float>}
+     */
+    private function scoreAllParticipants(array $vec): array
+    {
+        $bestByPid = [];
+        foreach ($this->enrolledVoiceprints as $e) {
+            $pid = (int) ($e['participant_id'] ?? 0);
+            if ($pid <= 0) {
+                continue;
+            }
+            $vec2 = $e['vector'] ?? null;
+            if (!is_array($vec2) || count($vec2) < 32) {
+                continue;
+            }
+            $s = $this->cosineSimilarity($vec, $vec2);
+            if (!isset($bestByPid[$pid]) || $s > (float) $bestByPid[$pid]) {
+                $bestByPid[$pid] = (float) $s;
+            }
+        }
+        arsort($bestByPid);
+        $posterior = $this->softmaxPosteriors($bestByPid);
+        return ['scores' => $bestByPid, 'posterior' => $posterior];
+    }
+
+    private function enrolledParticipantCount(): int
+    {
+        if (count($this->enrolledVoiceprints) === 0) {
+            return 0;
+        }
+        $pids = [];
+        foreach ($this->enrolledVoiceprints as $e) {
+            $pid = (int) ($e['participant_id'] ?? 0);
+            if ($pid > 0) {
+                $pids[$pid] = true;
+            }
+        }
+        return count($pids);
+    }
+
+    /**
      * @param array<int,float> $vec
      * @return array{0:int,1:float}|null
      */
@@ -1244,27 +2066,96 @@ class DeepgramLiveRelayConnection
         }
         $threshold = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
         $minMargin = (float) (env('MEETING_VOICEPRINT_MARGIN', 0.05));
+        // In 2-participant meetings, margins are often very small on mobile/mono streams.
+        // Reduce the required margin to avoid "never matched" behavior.
+        if ($this->enrolledParticipantCount() === 2) {
+            $minMargin = min($minMargin, (float) env('MEETING_VOICEPRINT_MARGIN_2P', 0.006));
+        }
         // If we only have 1 chunk of evidence, require a stronger score to avoid early mislabels.
         if ($evidenceCount < 2) {
             $threshold += (float) (env('MEETING_VOICEPRINT_EARLY_BOOST', 0.07));
         }
-        $bestId = null;
-        $bestScore = -1.0;
-        $secondBest = -1.0;
+        // Compute best score PER participant_id (participants can have multiple templates).
+        $bestByPid = [];
         foreach ($this->enrolledVoiceprints as $e) {
+            $pid = (int) $e['participant_id'];
+            if ($pid <= 0) {
+                continue;
+            }
             $score = $this->cosineSimilarity($vec, $e['vector']);
-            if ($score > $bestScore) {
-                $secondBest = $bestScore;
-                $bestScore = $score;
-                $bestId = (int) $e['participant_id'];
-            } elseif ($score > $secondBest) {
-                $secondBest = $score;
+            if (!isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+                $bestByPid[$pid] = (float) $score;
             }
         }
+        arsort($bestByPid);
+        $bestId = count($bestByPid) ? (int) array_key_first($bestByPid) : null;
+        $bestScore = $bestId ? (float) ($bestByPid[$bestId] ?? -1.0) : -1.0;
+        $vals = array_values($bestByPid);
+        $secondBest = count($vals) >= 2 ? (float) $vals[1] : -1.0;
         if ($bestId === null || $bestScore < $threshold) {
             return null;
         }
         if (($bestScore - max(-1.0, $secondBest)) < $minMargin) {
+            return null;
+        }
+        return [$bestId, $bestScore];
+    }
+
+    /**
+     * Fallback matcher for mono streams where diarization collapses:
+     * be more responsive early while still requiring a clear winner.
+     */
+    private function matchVoiceprintFallback(array $vec): ?array
+    {
+        if (count($this->enrolledVoiceprints) === 0) {
+            return null;
+        }
+
+        $base = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
+        $threshold = (float) env('MEETING_VOICEPRINT_FALLBACK_THRESHOLD', max(0.40, $base - 0.12));
+        // Allow lower fallback thresholds for mono/mobile where ECAPA cosine can be ~0.15–0.30.
+        $threshold = max(0.15, min(0.95, $threshold));
+        $minMargin = (float) env('MEETING_VOICEPRINT_FALLBACK_MARGIN', 0.015);
+        if ($this->enrolledParticipantCount() === 2) {
+            $minMargin = min($minMargin, (float) env('MEETING_VOICEPRINT_FALLBACK_MARGIN_2P', 0.006));
+        }
+        $minMargin = max(0.0, min(0.2, $minMargin));
+
+        // Compute best score PER participant_id (participants can have multiple templates).
+        $bestByPid = [];
+        foreach ($this->enrolledVoiceprints as $e) {
+            $pid = (int) $e['participant_id'];
+            if ($pid <= 0) {
+                continue;
+            }
+            $score = $this->cosineSimilarity($vec, $e['vector']);
+            if (!isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+                $bestByPid[$pid] = (float) $score;
+            }
+        }
+        arsort($bestByPid);
+        $bestId = count($bestByPid) ? (int) array_key_first($bestByPid) : null;
+        $bestScore = $bestId ? (float) ($bestByPid[$bestId] ?? -1.0) : -1.0;
+        $vals = array_values($bestByPid);
+        $secondBest = count($vals) >= 2 ? (float) $vals[1] : -1.0;
+
+        // If we only have a weak winner, require a stronger margin to avoid
+        // mis-attributing the 2nd speaker to the dominant speaker.
+        $effectiveMinMargin = $bestScore < 0.50 ? max($minMargin, 0.03) : $minMargin;
+        $this->lastFallbackMatching = [
+            'best_participant_id' => $bestId,
+            'best_score' => (float) $bestScore,
+            'second_best_score' => (float) $secondBest,
+            'threshold' => (float) $threshold,
+            'min_margin' => (float) $effectiveMinMargin,
+            'top_scores' => array_slice($bestByPid, 0, 6, true),
+        ];
+        $this->debugVoice('fallback_score', $this->lastFallbackMatching);
+
+        if ($bestId === null || $bestScore < $threshold) {
+            return null;
+        }
+        if (($bestScore - max(-1.0, $secondBest)) < $effectiveMinMargin) {
             return null;
         }
         return [$bestId, $bestScore];
@@ -1308,6 +2199,27 @@ class DeepgramLiveRelayConnection
             return;
         }
 
+        // CRITICAL: Ensure this connection is scoped to ONLY this meeting.
+        // The service object can live across multiple sessions in the same PHP process,
+        // so we must reset all meeting-derived caches/state to avoid reusing voiceprints
+        // from a previous meeting.
+        $this->enrolledParticipants = [];
+        $this->enrolledVoiceprints = [];
+        $this->enrolledParticipantNamesById = [];
+        $this->speakerVoiceprintHistory = [];
+        $this->labelLastEmbedAt = [];
+        $this->fallbackParticipantSeconds = [];
+        $this->fallbackLastAttributionCursor = 0.0;
+        $this->fallbackLastEmbedAt = 0.0;
+        $this->lastVoiceMatching = [];
+        $this->lastFallbackMatching = [];
+        $this->autoBoundLabels = [];
+        $this->selfEnrollLastAtByPid = [];
+        $this->lastEnrolledReloadAt = 0.0;
+        $this->speakerLabelToParticipantIdCache = [];
+        $this->speakerLabelToNameCache = [];
+        $this->lastSpeakerMapRefreshAt = 0.0;
+
         // Only allow "my name is X" based enrollment during the intro phase.
         // During the meeting we must rely on voiceprint matching only.
         $this->transcriptEnabled = $transcriptEnabled;
@@ -1348,6 +2260,7 @@ class DeepgramLiveRelayConnection
         // when the same name is detected in the live WS session.
         $this->loadEnrolledParticipants($meetingId);
         $this->loadEnrolledVoiceprints($meetingId);
+        $this->loadEnrolledParticipantIndex($meetingId);
         $this->embedEveryN = max(1, (int) (env('MEETING_WS_EMBED_EVERY_N', 5)));
         $this->bootstrapChunks = max(1, (int) (env('MEETING_WS_BOOTSTRAP_CHUNKS', 8)));
         // Faster, more "instant" identity locking defaults (tunable via .env).
@@ -1356,6 +2269,18 @@ class DeepgramLiveRelayConnection
         $this->labelMinSpeechSeconds = (float) (env('MEETING_WS_LABEL_MIN_SPEECH_SECONDS', 1.0));   // minimum speech to embed
         $this->labelEmbedCooldownSeconds = (float) (env('MEETING_WS_LABEL_EMBED_COOLDOWN_SECONDS', 1.5));
         $this->labelMinPurity = (float) (env('MEETING_WS_LABEL_MIN_PURITY', 0.65));
+        if (count($this->enrolledVoiceprints) >= 2) {
+            // Multi-participant meetings: keep matching fast but require enough speech
+            // to avoid "everyone scores the same" on tiny/noisy fragments.
+            $this->labelWindowSeconds = max($this->labelWindowSeconds, 2.5);
+            $this->labelMinSpeechSeconds = max($this->labelMinSpeechSeconds, 0.8);
+            $this->labelMinPurity = min($this->labelMinPurity, 0.20);
+            $this->labelEmbedCooldownSeconds = min($this->labelEmbedCooldownSeconds, 0.8);
+
+            // Embed more frequently at the start so the first identity lock happens in ~1–2s.
+            $this->embedEveryN = min($this->embedEveryN, 2);
+            $this->bootstrapChunks = min($this->bootstrapChunks, 3);
+        }
         if ($sttProvider === 'pulse') {
             // Pulse can produce long interim stretches before final boundaries.
             // Relax evidence requirements so voice matching still locks quickly.
@@ -1424,12 +2349,17 @@ class DeepgramLiveRelayConnection
         // Voice embedding is CPU-heavy (ffmpeg + python). Run slower and single-flight
         // so matching works without degrading live transcript latency.
         $voiceEmbedIntervalSeconds = (float) (env('MEETING_WS_VOICE_EMBED_INTERVAL_SECONDS', 1.2));
-        $voiceEmbedIntervalSeconds = max(0.6, min(6.0, $voiceEmbedIntervalSeconds));
+        // Multi-participant meetings: run fallback classification ~3x/sec.
+        if (count($this->enrolledVoiceprints) >= 2) {
+            $voiceEmbedIntervalSeconds = min($voiceEmbedIntervalSeconds, 0.33);
+        }
+        $voiceEmbedIntervalSeconds = max(0.25, min(6.0, $voiceEmbedIntervalSeconds));
         $this->voiceEmbedTimerId = EventLoop::repeat($voiceEmbedIntervalSeconds, function () use ($meetingId) {
             if ($this->voiceEmbeddingBusy) {
                 return;
             }
             try {
+                $this->maybeAttributeWithoutDiarization($meetingId);
                 $this->maybeComputeLabelEmbeddings($meetingId);
             } catch (Throwable) {
             }
@@ -1530,8 +2460,14 @@ class DeepgramLiveRelayConnection
                     $backoffMs = min(8000, (int) ($backoffMs * 1.6));
                 }
 
+                // Never block the event loop with usleep() (causes cascading WS failures).
                 try {
-                    \usleep((int) ($backoffMs * 1000));
+                    $sleep = EventLoop::getSuspension();
+                    $timer = EventLoop::delay(max(0.01, (float) $backoffMs / 1000.0), static function () use ($sleep): void {
+                        try { $sleep->resume(true); } catch (Throwable) {}
+                    });
+                    $sleep->suspend();
+                    try { EventLoop::cancel($timer); } catch (Throwable) {}
                 } catch (Throwable) {
                 }
             }
@@ -1784,13 +2720,14 @@ class DeepgramLiveRelayConnection
                 }
 
                 $label = $speaker === null ? 'speaker_unknown' : ('speaker_' . (int) $speaker);
-                // Even when transcript text is empty, diarization usually still tells
-                // us who is talking. We use that for real-time talk bars.
-                $this->activeSpeakerLabel = (string) $label;
-                $this->lastActiveSpeakerAt = (float) $now;
                 $t = (string) ($u['transcript'] ?? '');
+                // Only treat as active speech for realtime PCM fill / reconcile when there is
+                // actual text; empty diarization segments would otherwise pin "recent speech"
+                // for the whole meeting and attribute silence as talk time.
                 if ($t !== '') {
                     $t2 = trim($t);
+                    $this->activeSpeakerLabel = (string) $label;
+                    $this->lastActiveSpeakerAt = (float) $now;
                     if (!$isFinalChunk) {
                         // Keep interim text live, but skip heavy numeric aggregation until final.
                         $this->livePartialByLabel[$label] = $t2;
@@ -1807,6 +2744,16 @@ class DeepgramLiveRelayConnection
                             $speakerText[$label] = ($speakerText[$label] ?? '') . ' ' . $t2;
                         }
                     }
+
+                    $this->pushSttDebugWord([
+                        'type' => 'utterance',
+                        'label' => (string) $label,
+                        'speaker' => $speaker,
+                        'start' => $start,
+                        'end' => $end,
+                        'final' => (bool) $isFinalChunk,
+                        'text' => $t2,
+                    ]);
                 }
             }
         } else {
@@ -1865,6 +2812,18 @@ class DeepgramLiveRelayConnection
                     }
 
                     $label = $speaker === null ? 'speaker_unknown' : ('speaker_' . (int) $speaker);
+                    $wordTxt = trim((string) ($w['punctuated_word'] ?? ($w['word'] ?? '')));
+                    if ($wordTxt !== '') {
+                        $this->pushSttDebugWord([
+                            'type' => 'word',
+                            'label' => (string) $label,
+                            'speaker' => $speaker,
+                            'start' => $start,
+                            'end' => $end,
+                            'final' => (bool) $isFinalChunk,
+                            'word' => $wordTxt,
+                        ]);
+                    }
                     if ($isFinalChunk) {
                         $dur = max(0.0, $end - $start);
                         $this->speakerSeconds[$label] = ($this->speakerSeconds[$label] ?? 0.0) + $dur;
@@ -1873,14 +2832,18 @@ class DeepgramLiveRelayConnection
                         $this->recentSpeakerIntervals[] = ['label' => $label, 'start' => $start, 'end' => $end];
                     }
 
-                    // Word-level diarization can drive real-time bars even when text is delayed.
+                    // Word-level interim: only refresh "recent speech" when a real token arrived,
+                    // otherwise silence frames keep lastActiveSpeakerAt hot and realtime fill runs away.
                     if (!$isFinalChunk) {
                         $this->activeSpeakerLabel = (string) $label;
-                        $this->lastActiveSpeakerAt = (float) $now;
+                        $wordForActivity = $wordTxt;
+                        if ($wordForActivity !== '') {
+                            $this->lastActiveSpeakerAt = (float) $now;
+                        }
                     }
 
                     if ($isFinalChunk && !$preferChannelText) {
-                        $word = (string) ($w['punctuated_word'] ?? ($w['word'] ?? ''));
+                        $word = (string) $wordTxt;
                         if ($word !== '') {
                             // Word-level streams can repeat heavily; dedupe in small windows.
                             $word2 = trim($word);
@@ -1943,12 +2906,18 @@ class DeepgramLiveRelayConnection
             $this->appendSpeakerText((string) $label, (string) $text);
         }
 
-        // Intro-only: Run name detection on the full cumulative text per label.
-        // During the meeting we rely on voiceprint matching only.
-        if ($this->allowIntroEnrollment) {
+        // Name binding: allow "my name is X" to bind a live label to an already-enrolled participant.
+        // This is critical when diarization collapses to speaker_0 and voiceprint scores are weak.
+        // First detected name per label wins (no overwrites).
+        if ($this->allowIntroEnrollment || (bool) env('MEETING_WS_ALLOW_NAME_BINDING', false)) {
             foreach ($this->cumulativeSpeakerText as $label => $fullText) {
                 $name = $this->extractNameFromText($fullText);
                 if ($name === null) {
+                    continue;
+                }
+                // Only accept names that match an enrolled participant.
+                $enrolledId = $this->enrolledParticipants[strtolower($name)] ?? null;
+                if (!$enrolledId) {
                     continue;
                 }
 
@@ -1960,9 +2929,17 @@ class DeepgramLiveRelayConnection
                 } elseif (strtolower($existing['name']) === strtolower($name)) {
                     // Same name detected again — increase confidence.
                     $this->speakerDetectedName[$label]['count']++;
+                } else {
+                    // If Deepgram collapses multiple people into the same label (common in mono live streams),
+                    // don't let the later "my name is X" overwrite the earlier mapping.
+                    // Keeping the first stable prevents wrong attribution (Greg becoming David).
                 }
             }
         }
+
+        // Even when name binding is disabled for mapping, we can still use "my name is X" as a signal
+        // to self-enroll an additional voiceprint template for X (debug mode only).
+        $this->maybeSelfEnrollFromDetectedNames($meetingId);
 
         // Persist is handled by a dedicated timer to avoid blocking receive loop.
     }
@@ -2032,6 +3009,13 @@ class DeepgramLiveRelayConnection
 
     private function persistToDb(int $meetingId): void
     {
+        $this->maybeReloadEnrolledState($meetingId);
+        // Keep persisted stats in sync with the live UI behavior.
+        // Without this, meetings that end before STT finals land can show 0s talk-time.
+        $this->applyRealtimeActiveSpeakerEstimate();
+        $this->reconcileSpeakerSecondsWithAudioClock();
+        $this->clampSpeakerSecondsToPlausibleTimeline();
+
         $timeline = max(1.0, $this->totalSeconds, $this->audioCursorSeconds);
         $crosstalkPct = (float) round(($this->overlapSeconds / $timeline) * 100, 2);
 
@@ -2044,8 +3028,7 @@ class DeepgramLiveRelayConnection
         DB::transaction(function () use ($meetingId, $speechSum, $crosstalkPct) {
             $labelToParticipantId = [];
 
-            // Reset each persist so frontend reflects current state.
-            $this->lastVoiceMatching = [];
+            // Keep lastVoiceMatching across persists so UI/debug stays stable.
 
             foreach ($this->speakerSeconds as $label => $_sec) {
                 $mapping = SpeakerMapping::query()
@@ -2079,210 +3062,301 @@ class DeepgramLiveRelayConnection
                 $labelToParticipantId[$label] = (int) $mapping->participant_id;
             }
 
-            // Voice recognition: if we can match a label to an enrolled participant, redirect the mapping
-            // and delete the placeholder participant (so UI stops showing speaker_0/speaker_1).
-            foreach (array_keys($this->speakerSeconds) as $label) {
-                $label = (string) $label;
-                // Fast-path for the common single-user meeting:
-                // bind label in ~2-3s instead of waiting for many embeddings.
-                if (!isset($this->autoBoundLabels[$label]) && count($this->enrolledVoiceprints) === 1) {
-                    $sec = max(0.0, (float) ($this->speakerSeconds[$label] ?? 0.0));
-                    if ($sec >= 2.0) {
-                        $onlyPid = (int) ($this->enrolledVoiceprints[0]['participant_id'] ?? 0);
-                        if ($onlyPid > 0) {
-                            SpeakerMapping::query()
-                                ->where('meeting_id', $meetingId)
-                                ->where('speaker_label', $label)
-                                ->update([
-                                    'participant_id' => $onlyPid,
-                                    'confidence' => 0.99,
-                                ]);
-                            $labelToParticipantId[$label] = $onlyPid;
-                            $this->autoBoundLabels[$label] = true;
-                            $bestName = (string) (MeetingParticipant::query()->whereKey($onlyPid)->value('name') ?? '');
-                            $this->lastVoiceMatching[$label] = [
-                                'evidence_count' => 1,
-                                'best_participant_id' => $onlyPid,
-                                'best_participant_name' => $bestName,
-                                'best_score' => 0.99,
-                                'threshold' => 0.0,
-                                'matched' => true,
-                            ];
-                            continue;
+            $diarizationCollapsed = count($this->enrolledVoiceprints) >= 2 && $this->concreteDiarizedLabelCount() <= 1;
+
+            // IMPORTANT:
+            // When diarization collapses (everything is speaker_0), redirecting SpeakerMapping is harmful:
+            // it becomes "sticky" and all subsequent speech is attributed to the first matched participant.
+            // In that mode we must rely on rolling fallback attribution (fallbackParticipantSeconds) only.
+            if (!$diarizationCollapsed) {
+                // Voice recognition: if we can match a label to an enrolled participant, redirect the mapping
+                // and delete the placeholder participant (so UI stops showing speaker_0/speaker_1).
+                foreach (array_keys($this->speakerSeconds) as $label) {
+                    $label = (string) $label;
+                    // Fast-path for the common single-user meeting:
+                    // bind label in ~2-3s instead of waiting for many embeddings.
+                    if (!isset($this->autoBoundLabels[$label]) && count($this->enrolledVoiceprints) === 1) {
+                        $sec = max(0.0, (float) ($this->speakerSeconds[$label] ?? 0.0));
+                        if ($sec >= 2.0) {
+                            $onlyPid = (int) ($this->enrolledVoiceprints[0]['participant_id'] ?? 0);
+                            if ($onlyPid > 0) {
+                                SpeakerMapping::query()
+                                    ->where('meeting_id', $meetingId)
+                                    ->where('speaker_label', $label)
+                                    ->update([
+                                        'participant_id' => $onlyPid,
+                                        'confidence' => 0.99,
+                                    ]);
+                                $labelToParticipantId[$label] = $onlyPid;
+                                $this->autoBoundLabels[$label] = true;
+                                $bestName = (string) (MeetingParticipant::query()->whereKey($onlyPid)->value('name') ?? '');
+                                $this->lastVoiceMatching[$label] = [
+                                    'evidence_count' => 1,
+                                    'best_participant_id' => $onlyPid,
+                                    'best_participant_name' => $bestName,
+                                    'best_score' => 0.99,
+                                    'threshold' => 0.0,
+                                    'matched' => true,
+                                ];
+                                continue;
+                            }
                         }
                     }
-                }
-                $candidate = $this->getVoiceprintForLabel($label);
-                if (!$candidate) {
+                    $candidate = $this->getVoiceprintForLabel($label);
+                    if (!$candidate) {
+                        $this->lastVoiceMatching[$label] = [
+                            'evidence_count' => 0,
+                            'best_participant_id' => null,
+                            'best_participant_name' => '',
+                            'best_score' => 0.0,
+                            'threshold' => (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75)),
+                            'matched' => false,
+                        ];
+                        $this->debugVoice('no_label_voiceprint_yet', [
+                            'meeting_id' => $meetingId,
+                            'label' => $label,
+                            'total_seconds' => $this->totalSeconds,
+                            'window_seconds' => $this->labelWindowSeconds,
+                            'min_speech_seconds' => $this->labelMinSpeechSeconds,
+                        ]);
+                        continue;
+                    }
+                    $vec = $candidate['vec'];
+                    $count = (int) $candidate['count'];
+                    $scored = $this->scoreAllParticipants($vec);
+                    $bestByPid = (array) ($scored['scores'] ?? []);
+                    $posterior = (array) ($scored['posterior'] ?? []);
+                    $sum = $this->posteriorSummary($posterior);
+                    $bestId = $sum['pid'] > 0 ? (int) $sum['pid'] : null;
+                    $vals = array_values($bestByPid);
+                    $bestScore = (float) ($vals[0] ?? -1.0);
+                    $secondBest = (float) ($vals[1] ?? -1.0);
+                    $bestName = $bestId ? (string) (MeetingParticipant::query()->whereKey((int) $bestId)->value('name') ?? '') : '';
+                    $speechSeconds = max(0.0, (float) ($this->speakerSeconds[$label] ?? 0.0));
+
+                    // EMA over posteriors per label so multi-class (5+) converges.
+                    $alpha = (float) env('MEETING_VOICEPRINT_POSTERIOR_EMA_ALPHA', 0.35);
+                    $alpha = max(0.05, min(0.95, $alpha));
+                    $ema = $this->labelPosteriorEma[$label] ?? [];
+                    foreach ($posterior as $pid => $p) {
+                        $pid = (int) $pid;
+                        $prev = (float) ($ema[$pid] ?? 0.0);
+                        $ema[$pid] = ($alpha * (float) $p) + ((1.0 - $alpha) * $prev);
+                    }
+                    foreach ($ema as $pid => $p) {
+                        if (!array_key_exists((int) $pid, $posterior)) {
+                            $ema[(int) $pid] = (float) ($p * (1.0 - ($alpha * 0.20)));
+                        }
+                    }
+                    arsort($ema);
+                    $emaTopPid = count($ema) ? (int) array_key_first($ema) : 0;
+                    $emaVals = array_values($ema);
+                    $emaTopP = (float) ($emaVals[0] ?? 0.0);
+                    $emaSecondP = (float) ($emaVals[1] ?? 0.0);
+                    $this->labelPosteriorEma[$label] = $ema;
+
+                    // Stability gating (hysteresis) for accurate binding.
+                    $minPosterior = (float) env('MEETING_VOICEPRINT_LABEL_MIN_POSTERIOR', 0.60);
+                    $minPosterior = max(0.25, min(0.95, $minPosterior));
+                    $minGap = (float) env('MEETING_VOICEPRINT_LABEL_MIN_POSTERIOR_GAP', 0.03);
+                    $minGap = max(0.0, min(0.5, $minGap));
+                    $stableWindows = (int) env('MEETING_VOICEPRINT_LABEL_STABLE_WINDOWS', 2);
+                    $stableWindows = max(1, min(10, $stableWindows));
+                    $afterSeconds = (float) env('MEETING_VOICEPRINT_LABEL_MIN_SPEECH_BEFORE_BIND', 1.0);
+                    $afterSeconds = max(0.0, min(10.0, $afterSeconds));
+
+                    $prevStablePid = (int) ($this->labelStablePid[$label] ?? 0);
+                    $prevStableCount = (int) ($this->labelStableCount[$label] ?? 0);
+                    if ($emaTopPid !== $prevStablePid) {
+                        if ($emaTopPid > 0 && $emaTopP >= $minPosterior && (($emaTopP - $emaSecondP) >= $minGap)) {
+                            $this->labelStablePid[$label] = $emaTopPid;
+                            $this->labelStableCount[$label] = 1;
+                        } else {
+                            $this->labelStableCount[$label] = 0;
+                        }
+                    } else {
+                        $this->labelStableCount[$label] = $prevStableCount + 1;
+                    }
+                    $stablePid = (int) ($this->labelStablePid[$label] ?? 0);
+                    $stableCount = (int) ($this->labelStableCount[$label] ?? 0);
+
+                    $matched = $stablePid > 0
+                        && $speechSeconds >= $afterSeconds
+                        && $stableCount >= $stableWindows;
+                    $usedThreshold = $minPosterior;
+
                     $this->lastVoiceMatching[$label] = [
-                        'evidence_count' => 0,
-                        'best_participant_id' => null,
-                        'best_participant_name' => '',
-                        'best_score' => 0.0,
-                        'threshold' => (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75)),
-                        'matched' => false,
+                        'evidence_count' => $count,
+                        'best_participant_id' => $bestId,
+                        'best_participant_name' => $bestName,
+                        'best_score' => (float) $bestScore,
+                        'threshold' => (float) $usedThreshold,
+                        'matched' => (bool) $matched,
+                        'posterior_top' => (float) $sum['p'],
+                        'posterior_second' => (float) $sum['second_p'],
+                        'ema_top_pid' => (int) $emaTopPid,
+                        'ema_top_p' => (float) $emaTopP,
+                        'ema_second_p' => (float) $emaSecondP,
+                        'stable_pid' => (int) $stablePid,
+                        'stable_count' => (int) $stableCount,
                     ];
-                    $this->debugVoice('no_label_voiceprint_yet', [
+                    $this->debugVoice('score', [
                         'meeting_id' => $meetingId,
                         'label' => $label,
-                        'total_seconds' => $this->totalSeconds,
-                        'window_seconds' => $this->labelWindowSeconds,
-                        'min_speech_seconds' => $this->labelMinSpeechSeconds,
+                        'evidence_count' => $count,
+                        'best_participant_id' => $bestId,
+                        'best_participant_name' => $bestName,
+                        'best_score' => $bestScore,
+                        'threshold' => $usedThreshold,
+                        'second_best_score' => $secondBest,
+                        'top_scores' => array_slice($bestByPid, 0, 6, true),
+                        'top_posteriors' => array_slice($posterior, 0, 6, true),
+                        'ema_top_pid' => $emaTopPid,
+                        'ema_top_p' => $emaTopP,
+                        'ema_second_p' => $emaSecondP,
+                        'stable_pid' => $stablePid,
+                        'stable_count' => $stableCount,
+                        'speech_seconds' => $speechSeconds,
                     ]);
-                    continue;
-                }
-                $vec = $candidate['vec'];
-                $count = (int) $candidate['count'];
-                // Log best score even when it doesn't pass threshold.
-                $baseThreshold = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
-                $threshold = $baseThreshold + ($count < 2 ? (float) (env('MEETING_VOICEPRINT_EARLY_BOOST', 0.07)) : 0.0);
-                $bestId = null;
-                $bestScore = -1.0;
-                $secondBest = -1.0;
-                foreach ($this->enrolledVoiceprints as $e) {
-                    $s = $this->cosineSimilarity($vec, $e['vector']);
-                    if ($s > $bestScore) {
-                        $secondBest = $bestScore;
-                        $bestScore = $s;
-                        $bestId = (int) $e['participant_id'];
-                    } elseif ($s > $secondBest) {
-                        $secondBest = $s;
+
+                    if (!$matched) {
+                        continue;
                     }
-                }
-                $bestName = $bestId ? (string) (MeetingParticipant::query()->whereKey($bestId)->value('name') ?? '') : '';
-                $speechSeconds = max(0.0, (float) ($this->speakerSeconds[$label] ?? 0.0));
-                $fastIdentify = (bool) env('MEETING_WS_FAST_IDENTIFY', true);
-                $fastAfterSeconds = max(0.5, (float) env('MEETING_WS_FAST_IDENTIFY_AFTER_SECONDS', 2.0));
-                $fastMinScore = (float) env('MEETING_WS_FAST_IDENTIFY_MIN_SCORE', 0.62);
-                $fastMinMargin = (float) env('MEETING_WS_FAST_IDENTIFY_MIN_MARGIN', 0.015);
-                $fastMatched = $fastIdentify
-                    && $bestId !== null
-                    && $speechSeconds >= $fastAfterSeconds
-                    && $bestScore >= $fastMinScore
-                    && (($bestScore - max(-1.0, $secondBest)) >= $fastMinMargin);
+                    $matchedParticipantId = (int) $stablePid;
+                    $score = (float) $emaTopP;
 
-                $matched = ($bestId !== null && ($bestScore >= $threshold || $fastMatched));
-                $usedThreshold = $fastMatched ? min($threshold, $fastMinScore) : $threshold;
-                $this->lastVoiceMatching[$label] = [
-                    'evidence_count' => $count,
-                    'best_participant_id' => $bestId,
-                    'best_participant_name' => $bestName,
-                    'best_score' => (float) $bestScore,
-                    'threshold' => (float) $usedThreshold,
-                    'matched' => (bool) $matched,
-                ];
-                $this->debugVoice('score', [
-                    'meeting_id' => $meetingId,
-                    'label' => $label,
-                    'evidence_count' => $count,
-                    'best_participant_id' => $bestId,
-                    'best_participant_name' => $bestName,
-                    'best_score' => $bestScore,
-                    'threshold' => $threshold,
-                    'second_best_score' => $secondBest,
-                    'fast_matched' => $fastMatched,
-                    'speech_seconds' => $speechSeconds,
-                ]);
+                    $currentPid = $labelToParticipantId[$label] ?? null;
+                    if (!$currentPid) {
+                        continue;
+                    }
+                    $matchedParticipantId = (int) $matchedParticipantId;
 
-                $match = $matched ? [$bestId, $bestScore] : null;
-                if (!$match) {
-                    continue;
-                }
-                [$matchedParticipantId, $score] = $match;
+                    if ($matchedParticipantId === (int) $currentPid) {
+                        // Still update confidence so we can debug/tune later.
+                        SpeakerMapping::query()
+                            ->where('meeting_id', $meetingId)
+                            ->where('speaker_label', $label)
+                            ->update(['confidence' => (float) $score]);
+                        continue;
+                    }
 
-                $currentPid = $labelToParticipantId[$label] ?? null;
-                if (!$currentPid) {
-                    continue;
-                }
-                $matchedParticipantId = (int) $matchedParticipantId;
-
-                if ($matchedParticipantId === (int) $currentPid) {
-                    // Still update confidence so we can debug/tune later.
+                    // Redirect mapping to the enrolled participant.
                     SpeakerMapping::query()
                         ->where('meeting_id', $meetingId)
                         ->where('speaker_label', $label)
-                        ->update(['confidence' => (float) $score]);
-                    continue;
-                }
+                        ->update([
+                            'participant_id' => $matchedParticipantId,
+                            'confidence' => (float) $score,
+                        ]);
 
-                // Redirect mapping to the enrolled participant.
-                SpeakerMapping::query()
-                    ->where('meeting_id', $meetingId)
-                    ->where('speaker_label', $label)
-                    ->update([
-                        'participant_id' => $matchedParticipantId,
-                        'confidence' => (float) $score,
-                    ]);
+                    // Delete placeholder participant if it looks generated.
+                    $placeholder = MeetingParticipant::query()->whereKey((int) $currentPid)->first();
+                    if ($placeholder) {
+                        $isPlaceholder =
+                            preg_match('/^Speaker\s+\d+$/i', (string) $placeholder->name) === 1
+                            || preg_match('/^speaker_\d+$/i', (string) $placeholder->name) === 1;
 
-                // Delete placeholder participant if it looks generated.
-                $placeholder = MeetingParticipant::query()->whereKey((int) $currentPid)->first();
-                if ($placeholder) {
-                    $isPlaceholder =
-                        preg_match('/^Speaker\s+\d+$/i', (string) $placeholder->name) === 1
-                        || preg_match('/^speaker_\d+$/i', (string) $placeholder->name) === 1;
-
-                    if ($isPlaceholder) {
-                        $placeholder->delete();
+                        if ($isPlaceholder) {
+                            $placeholder->delete();
+                        }
                     }
-                }
 
-                $labelToParticipantId[$label] = $matchedParticipantId;
+                    $labelToParticipantId[$label] = $matchedParticipantId;
+                }
             }
 
-            // Apply detected name to each WS speaker label.
+            // Fallback persist: if diarization collapsed to one label but we have direct per-participant attribution,
+            // update ParticipantStat rows so analytics reflect the session correctly.
+            if (count($this->fallbackParticipantSeconds) > 0 && count($this->enrolledVoiceprints) >= 2 && $this->concreteDiarizedLabelCount() <= 1) {
+                $sum = 0.0;
+                foreach ($this->fallbackParticipantSeconds as $sec) {
+                    $sum += max(0.0, (float) $sec);
+                }
+                $sum = max(1.0, $sum);
+
+                foreach ($this->fallbackParticipantSeconds as $pid => $sec) {
+                    $pid = (int) $pid;
+                    if ($pid <= 0) {
+                        continue;
+                    }
+
+                    $talkTime = (int) round(max(0.0, (float) $sec));
+                    $talkPct = (float) round(($talkTime / $sum) * 100, 2);
+                    $talkPct = min(100.0, max(0.0, $talkPct));
+
+                    $existing = ParticipantStat::query()
+                        ->where('meeting_id', $meetingId)
+                        ->where('participant_id', $pid)
+                        ->first();
+
+                    ParticipantStat::updateOrCreate(
+                        ['meeting_id' => $meetingId, 'participant_id' => $pid],
+                        [
+                            'talk_time' => $talkTime,
+                            'talk_percentage' => $talkPct,
+                            'interruptions' => (int) ($existing?->interruptions ?? 0),
+                            'times_spoken' => (int) ($existing?->times_spoken ?? 0),
+                        ]
+                    );
+                }
+            }
+
+            // Apply detected name to each WS speaker label (intro only; avoid sticky relabeling in collapsed mode).
             // If the same name was enrolled via HTTP intro, merge by redirecting
             // the SpeakerMapping to the enrolled participant (no duplicate rows).
-            foreach ($this->speakerDetectedName as $label => $detection) {
-                $pid = $labelToParticipantId[$label] ?? null;
-                if (!$pid) {
-                    continue;
-                }
+            if (!$diarizationCollapsed) {
+                foreach ($this->speakerDetectedName as $label => $detection) {
+                    $pid = $labelToParticipantId[$label] ?? null;
+                    if (!$pid) {
+                        continue;
+                    }
 
-                $realName    = $detection['name'];
-                $participant = MeetingParticipant::query()->whereKey($pid)->first();
-                if (!$participant) {
-                    continue;
-                }
+                    $realName    = $detection['name'];
+                    $participant = MeetingParticipant::query()->whereKey($pid)->first();
+                    if (!$participant) {
+                        continue;
+                    }
 
-                $isPlaceholder = preg_match('/^Speaker\s+\d+$/i', (string) $participant->name) === 1
-                    || preg_match('/^speaker_\d+$/i', (string) $participant->name) === 1;
+                    $isPlaceholder = preg_match('/^Speaker\s+\d+$/i', (string) $participant->name) === 1
+                        || preg_match('/^speaker_\d+$/i', (string) $participant->name) === 1;
 
-                if (!$isPlaceholder) {
-                    continue;
-                }
+                    if (!$isPlaceholder) {
+                        continue;
+                    }
 
-                // Check if HTTP-enrolled participant with this name already exists.
-                $enrolledId = $this->enrolledParticipants[strtolower($realName)] ?? null;
+                    // Check if HTTP-enrolled participant with this name already exists.
+                    $enrolledId = $this->enrolledParticipants[strtolower($realName)] ?? null;
 
-                if ($enrolledId && $enrolledId !== $pid) {
-                    // Redirect the SpeakerMapping to the HTTP-enrolled participant
-                    // so talk time is attributed to the correct DB row.
-                    SpeakerMapping::query()
-                        ->where('meeting_id', $meetingId)
-                        ->where('speaker_label', $label)
-                        ->update(['participant_id' => $enrolledId]);
+                    if ($enrolledId && $enrolledId !== $pid) {
+                        // Redirect the SpeakerMapping to the HTTP-enrolled participant
+                        // so talk time is attributed to the correct DB row.
+                        SpeakerMapping::query()
+                            ->where('meeting_id', $meetingId)
+                            ->where('speaker_label', $label)
+                            ->update(['participant_id' => $enrolledId]);
 
-                    // Remove the orphaned WS placeholder.
-                    $participant->delete();
+                        // Remove the orphaned WS placeholder.
+                        $participant->delete();
 
-                    $labelToParticipantId[$label] = $enrolledId;
-                } else {
-                    // No HTTP-enrolled counterpart — rename the WS placeholder in place.
-                    $participant->update([
-                        'name' => $realName,
-                        'voice_embedding' => [
-                            'provider' => 'deepgram',
-                            'type' => 'intro_name_enrollment',
-                            'speaker_label' => $label,
-                            'enrolled_name' => $realName,
-                            'enrolled_at' => now()->toISOString(),
-                            'name_confidence' => $detection['count'],
-                        ],
-                    ]);
+                        $labelToParticipantId[$label] = $enrolledId;
+                    } else {
+                        // No HTTP-enrolled counterpart — rename the WS placeholder in place.
+                        $participant->update([
+                            'name' => $realName,
+                            'voice_embedding' => [
+                                'provider' => 'deepgram',
+                                'type' => 'intro_name_enrollment',
+                                'speaker_label' => $label,
+                                'enrolled_name' => $realName,
+                                'enrolled_at' => now()->toISOString(),
+                                'name_confidence' => $detection['count'],
+                            ],
+                        ]);
 
-                    // Also register in the enrolled map so subsequent detections
-                    // of the same name reuse this participant.
-                    $this->enrolledParticipants[strtolower($realName)] = $pid;
+                        // Also register in the enrolled map so subsequent detections
+                        // of the same name reuse this participant.
+                        $this->enrolledParticipants[strtolower($realName)] = $pid;
+                    }
                 }
             }
 
@@ -2335,6 +3409,7 @@ class DeepgramLiveRelayConnection
      */
     private function reconcileSpeakerSecondsWithAudioClock(): void
     {
+        $now = microtime(true);
         $sum = 0.0;
         foreach ($this->speakerSeconds as $s) {
             $sum += max(0.0, (float) $s);
@@ -2360,7 +3435,8 @@ class DeepgramLiveRelayConnection
         }
 
         $orphan = $dCur - $dSum;
-        if ($orphan > 0.04 && $orphan <= 3.0 && count($this->speakerSeconds) > 0) {
+        $recentSpeech = $this->lastActiveSpeakerAt > 0.0 && ($now - $this->lastActiveSpeakerAt) <= 0.8;
+        if ($orphan > 0.04 && $orphan <= 3.0 && count($this->speakerSeconds) > 0 && $recentSpeech) {
             $last = $this->recentSpeakerIntervals[count($this->recentSpeakerIntervals) - 1] ?? null;
             $lastLabel = is_array($last) ? (string) ($last['label'] ?? '') : '';
             if ($lastLabel === '' || !array_key_exists($lastLabel, $this->speakerSeconds)) {
@@ -2470,6 +3546,64 @@ class DeepgramLiveRelayConnection
         // Diarized seconds + realtime "fill" can exceed received PCM (double-count); keep UI sane vs live_audio_seconds.
         $this->clampSpeakerSecondsToPlausibleTimeline();
 
+        // If diarization collapsed (<=1 label) but we have per-participant attribution, prefer it for the live UI.
+        if (count($this->enrolledVoiceprints) >= 2
+            && $this->concreteDiarizedLabelCount() <= 1
+            && count($this->enrolledParticipantNamesById) > 0
+            && count($this->fallbackParticipantSeconds) > 0) {
+            $stats = [];
+            $sum = 0.0;
+            foreach ($this->fallbackParticipantSeconds as $sec) {
+                $sum += max(0.0, (float) $sec);
+            }
+            $sum = max(0.001, $sum);
+
+            foreach ($this->enrolledParticipantNamesById as $pid => $name) {
+                $sec = max(0.0, (float) ($this->fallbackParticipantSeconds[(int) $pid] ?? 0.0));
+                $pct = (float) round(($sec / $sum) * 100, 2);
+                $pct = min(100.0, max(0.0, $pct));
+                $stats[] = [
+                    'participant_id' => (int) $pid,
+                    'label' => '',
+                    'name' => (string) $name,
+                    'talk_time' => (int) floor($sec),
+                    'talk_time_seconds' => $sec,
+                    'talk_percentage' => $pct,
+                    'times_spoken' => 0,
+                ];
+            }
+
+            $payload = [
+                'meeting_id' => $meetingId,
+                'total_participants' => count($stats),
+                'participants' => $stats,
+                'crosstalk_percentage' => (float) $this->computeLiveCrosstalkPercentage(),
+                'live_audio_seconds' => (float) $this->audioCursorSeconds,
+                'voice_config' => [
+                    'format' => $this->audioFormat,
+                    'threshold' => (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75)),
+                    'early_boost' => (float) (env('MEETING_VOICEPRINT_EARLY_BOOST', 0.07)),
+                    'label_window_seconds' => (float) $this->labelWindowSeconds,
+                    'label_min_speech_seconds' => (float) $this->labelMinSpeechSeconds,
+                ],
+                'voice_matching' => array_merge($this->lastVoiceMatching, [
+                    '_fallback_last' => $this->lastFallbackMatching,
+                ]),
+                'updated_at' => null,
+            ];
+            if ($this->voiceDebug) {
+                $payload['debug'] = [
+                    'diarization_collapsed' => true,
+                    'concrete_diarized_label_count' => $this->concreteDiarizedLabelCount(),
+                    'label_to_participant_id' => $this->speakerLabelToParticipantIdCache,
+                    'label_to_name' => $this->speakerLabelToNameCache,
+                    'last_stt_words' => array_slice($this->lastSttWords, -30),
+                    'last_stt_words_updated_at' => $this->lastSttWordsUpdatedAt,
+                ];
+            }
+            return $payload;
+        }
+
         // Live WS mode should feel real-time. DB stats store integer seconds (by design),
         // which makes the UI jump/lag. Prefer the in-memory floating seconds when available.
         $liveSeconds = $this->speakerSeconds;
@@ -2524,7 +3658,7 @@ class DeepgramLiveRelayConnection
             ? $this->computeLiveCrosstalkPercentage()
             : (float) ($analytic?->crosstalk_percentage ?? 0);
 
-        return [
+        $payload = [
             'meeting_id' => $meetingId,
             'total_participants' => count($stats),
             'participants' => $stats,
@@ -2537,8 +3671,33 @@ class DeepgramLiveRelayConnection
                 'label_window_seconds' => (float) $this->labelWindowSeconds,
                 'label_min_speech_seconds' => (float) $this->labelMinSpeechSeconds,
             ],
-            'voice_matching' => $this->lastVoiceMatching,
+            'voice_matching' => array_merge($this->lastVoiceMatching, [
+                '_fallback_last' => $this->lastFallbackMatching,
+            ]),
             'updated_at' => $analytic?->updated_at?->toISOString(),
         ];
+        if ($this->voiceDebug) {
+            $payload['debug'] = [
+                'diarization_collapsed' => (count($this->enrolledVoiceprints) >= 2 && $this->concreteDiarizedLabelCount() <= 1),
+                'concrete_diarized_label_count' => $this->concreteDiarizedLabelCount(),
+                'label_to_participant_id' => $this->speakerLabelToParticipantIdCache,
+                'label_to_name' => $this->speakerLabelToNameCache,
+                'last_stt_words' => array_slice($this->lastSttWords, -30),
+                'last_stt_words_updated_at' => $this->lastSttWordsUpdatedAt,
+            ];
+        }
+        return $payload;
+    }
+
+    private function pushSttDebugWord(array $item): void
+    {
+        if (!$this->voiceDebug) {
+            return;
+        }
+        $this->lastSttWords[] = $item;
+        if (count($this->lastSttWords) > 120) {
+            $this->lastSttWords = array_slice($this->lastSttWords, -120);
+        }
+        $this->lastSttWordsUpdatedAt = microtime(true);
     }
 }

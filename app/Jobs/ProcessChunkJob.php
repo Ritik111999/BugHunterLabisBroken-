@@ -17,6 +17,7 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Process\Process;
 use Throwable;
@@ -30,6 +31,7 @@ class ProcessChunkJob implements ShouldQueue
     public int $chunkIndex;
     public string $mode;
     public ?float $durationSeconds = null;
+    private ?string $lastVoiceprintEngine = null;
 
     public function __construct(
         int $meetingId,
@@ -297,7 +299,8 @@ class ProcessChunkJob implements ShouldQueue
 
     /**
      * FIX #3: Improved name extraction.
-     * - Takes the LAST match of "my name is X" to handle bleed-over from previous speaker.
+     * - Intro mode: takes the FIRST match (each intro clip is for one person; avoid bleed from other voices).
+     * - Meeting mode: takes the LAST match to handle bleed-over from previous speaker.
      * - Captures up to 3 words to support full names (e.g. "Chandra Kant Arya").
      * - Avoids common trailing filler words.
      */
@@ -313,7 +316,7 @@ class ProcessChunkJob implements ShouldQueue
         $t = preg_replace('/\s+/', ' ', $t) ?? $t;
 
         // Match common enrollment phrases. Capture up to 3 words (letters) for full names.
-        // We still take the LAST match to avoid bleed-over from earlier speakers.
+        // We still take the LAST match in meeting mode to avoid bleed-over from earlier speakers.
         $matches = [];
         preg_match_all(
             '/\b(?:my name is|my name\'s|i am|this is|it\'s|its|im|i\'m|call me|you can call me)\s+([a-z][a-z]{1,29}(?:\s+[a-z][a-z]{1,29}){0,2})\b/iu',
@@ -325,9 +328,13 @@ class ProcessChunkJob implements ShouldQueue
             return null;
         }
 
-        // FIX: Take the LAST match — if two speakers bled into one transcript,
-        // the last "my name is X" is the most recent/correct one.
-        $raw = trim((string) end($matches[1]));
+        // Intro clips are intended to contain a single participant name at the start.
+        // If another name bleeds into the end of the clip, taking the LAST match
+        // can incorrectly save David's voiceprint under Getty (or vice versa).
+        $useFirst = $this->mode === 'intro';
+        $raw = $useFirst
+            ? trim((string) ($matches[1][0] ?? ''))
+            : trim((string) end($matches[1]));
         $raw = preg_replace('/[^a-z\s]/i', '', $raw) ?? $raw;
         $raw = trim(preg_replace('/\s+/', ' ', $raw) ?? $raw);
 
@@ -575,22 +582,27 @@ class ProcessChunkJob implements ShouldQueue
                         'enrolled_at' => now()->toISOString(),
                     ];
 
-                    // Attach voiceprint if available for this label.
-                    $vec = $speakerEmbeddings[$label] ?? null;
-                    if (is_array($vec) && count($vec) > 0) {
-                        $enrolledEmbedding['voiceprint'] = $vec;
-                        $enrolledEmbedding['voiceprint_dim'] = count($vec);
-                    } elseif (is_array($globalEmbedding) && count($globalEmbedding) > 0) {
-                        // Fast path: analyzer already computed a global embedding for intro clips.
-                        $enrolledEmbedding['voiceprint'] = array_map('floatval', $globalEmbedding);
-                        $enrolledEmbedding['voiceprint_dim'] = count($enrolledEmbedding['voiceprint']);
-                    } elseif ($this->filePath) {
-                        // Fallback: always store a voiceprint during intro enrollment.
-                        // Analyzer might skip global_embedding if SpeechBrain isn't available or hasn't warmed up yet.
+                    // Attach voiceprint for enrollment.
+                    // IMPORTANT: always prefer `embed_audio.py` output so live relay + intro embeddings
+                    // come from the same model + normalization (otherwise cosine scores stay ~0.4 and never match).
+                    $computed = null;
+                    if ($this->filePath) {
                         $computed = $this->computeVoiceprint(Storage::path($this->filePath));
-                        if (is_array($computed) && count($computed) > 0) {
-                            $enrolledEmbedding['voiceprint'] = $computed;
-                            $enrolledEmbedding['voiceprint_dim'] = count($computed);
+                    }
+                    if (is_array($computed) && count($computed) >= 32) {
+                        $enrolledEmbedding['voiceprint'] = array_map('floatval', $computed);
+                        $enrolledEmbedding['voiceprint_dim'] = count($enrolledEmbedding['voiceprint']);
+                        if (is_string($this->lastVoiceprintEngine) && $this->lastVoiceprintEngine !== '') {
+                            $enrolledEmbedding['voiceprint_engine'] = $this->lastVoiceprintEngine;
+                        }
+                    } else {
+                        $vec = $speakerEmbeddings[$label] ?? null;
+                        if (is_array($vec) && count($vec) >= 32) {
+                            $enrolledEmbedding['voiceprint'] = array_map('floatval', $vec);
+                            $enrolledEmbedding['voiceprint_dim'] = count($enrolledEmbedding['voiceprint']);
+                        } elseif (is_array($globalEmbedding) && count($globalEmbedding) >= 32) {
+                            $enrolledEmbedding['voiceprint'] = array_map('floatval', $globalEmbedding);
+                            $enrolledEmbedding['voiceprint_dim'] = count($enrolledEmbedding['voiceprint']);
                         }
                     }
 
@@ -600,6 +612,71 @@ class ProcessChunkJob implements ShouldQueue
                         ->whereRaw('LOWER(name) = ?', [strtolower($realName)])
                         ->first();
 
+                    // Guard against intro "bleed": each intro chunk has its own scoped diarization labels
+                    // (`chunk0_speaker_0`, `chunk1_speaker_0`, ...). If name extraction mistakenly returns an
+                    // existing participant's name from another chunk, do NOT append/overwrite templates, as it
+                    // corrupts enrollment for multi-speaker meetings.
+                    if ($named) {
+                        $prevEmbed = is_array($named->voice_embedding) ? $named->voice_embedding : [];
+                        $prevLabel = (string) ($prevEmbed['speaker_label'] ?? '');
+                        $curLabel = (string) $label;
+                        $prevChunk = null;
+                        $curChunk = null;
+                        if (preg_match('/^chunk(\d+)_/i', $prevLabel, $m)) {
+                            $prevChunk = (int) $m[1];
+                        }
+                        if (preg_match('/^chunk(\d+)_/i', $curLabel, $m2)) {
+                            $curChunk = (int) $m2[1];
+                        }
+                        if ($prevChunk !== null && $curChunk !== null && $prevChunk !== $curChunk) {
+                            Log::warning('intro_name_collision_skipped', [
+                                'meeting_id' => $meetingId,
+                                'enrolled_name' => $realName,
+                                'speaker_label' => $curLabel,
+                                'conflicts_with_participant_id' => (int) $named->id,
+                                'conflicts_with_speaker_label' => $prevLabel,
+                            ]);
+                            continue;
+                        }
+                    }
+
+                    // Safety: if this intro clip accidentally contains another person's voice (bleed / wrong clip),
+                    // the computed voiceprint can become nearly identical to an existing participant's voiceprint.
+                    // In that case, refuse to save it so we don't corrupt enrollment.
+                    $newVp = $enrolledEmbedding['voiceprint'] ?? null;
+                    if (is_array($newVp) && count($newVp) >= 32) {
+                        $dupThr = (float) env('MEETING_INTRO_DUPLICATE_VOICEPRINT_SIM', 0.985);
+                        $dupThr = max(0.85, min(0.999, $dupThr));
+                        $others = MeetingParticipant::query()
+                            ->where('meeting_id', $meetingId)
+                            ->whereNotNull('voice_embedding')
+                            ->get(['id', 'name', 'voice_embedding']);
+                        foreach ($others as $op) {
+                            if ($named && (int) $op->id === (int) $named->id) {
+                                continue;
+                            }
+                            $ove = is_array($op->voice_embedding) ? $op->voice_embedding : [];
+                            $ovp = $ove['voiceprint'] ?? null;
+                            if (!is_array($ovp) || count($ovp) < 32) {
+                                continue;
+                            }
+                            $sim = $this->cosineSimilarity($newVp, array_map('floatval', $ovp));
+                            if ($sim >= $dupThr) {
+                                Log::warning('intro_voiceprint_duplicate_suspected', [
+                                    'meeting_id' => $meetingId,
+                                    'enrolled_name' => $realName,
+                                    'speaker_label' => $label,
+                                    'similarity' => $sim,
+                                    'threshold' => $dupThr,
+                                    'conflicts_with_participant_id' => (int) $op->id,
+                                    'conflicts_with_name' => (string) ($op->name ?? ''),
+                                ]);
+                                unset($enrolledEmbedding['voiceprint'], $enrolledEmbedding['voiceprint_dim']);
+                                break;
+                            }
+                        }
+                    }
+
                     if (!$named) {
                         $named = MeetingParticipant::create([
                             'meeting_id' => $meetingId,
@@ -608,11 +685,52 @@ class ProcessChunkJob implements ShouldQueue
                             'voice_embedding' => $enrolledEmbedding,
                         ]);
                     } else {
+                        $prev = is_array($named->voice_embedding) ? $named->voice_embedding : [];
+
+                        // If the same person enrolls multiple times, keep multiple voiceprints.
+                        // This makes matching robust (different mic distance/noise) and avoids
+                        // "second person gets absorbed into first" when only one template exists.
+                        $hasNewVoiceprint = is_array($enrolledEmbedding['voiceprint'] ?? null) && count((array) $enrolledEmbedding['voiceprint']) >= 32;
+                        if ($hasNewVoiceprint) {
+                            $voiceprints = [];
+                            $existingList = $prev['voiceprints'] ?? null;
+                            if (is_array($existingList)) {
+                                foreach ($existingList as $v) {
+                                    if (is_array($v) && count($v) >= 32) {
+                                        $voiceprints[] = array_map('floatval', $v);
+                                    }
+                                }
+                            }
+                            $existingVp = $prev['voiceprint'] ?? null;
+                            if (is_array($existingVp) && count($existingVp) >= 32) {
+                                $voiceprints[] = array_map('floatval', $existingVp);
+                            }
+                            $voiceprints[] = array_map('floatval', (array) $enrolledEmbedding['voiceprint']);
+
+                            // Keep most recent N templates.
+                            $max = (int) env('MEETING_INTRO_MAX_VOICEPRINTS_PER_PERSON', 5);
+                            $max = max(1, min(10, $max));
+                            if (count($voiceprints) > $max) {
+                                $voiceprints = array_slice($voiceprints, -1 * $max);
+                            }
+
+                            // Prefer keeping the existing primary voiceprint stable; only set it if missing.
+                            if (!is_array($prev['voiceprint'] ?? null) || count((array) ($prev['voiceprint'] ?? [])) < 32) {
+                                $prev['voiceprint'] = $voiceprints[count($voiceprints) - 1];
+                            }
+                            $prev['voiceprint_dim'] = is_array($prev['voiceprint'] ?? null) ? count((array) $prev['voiceprint']) : 0;
+                            $prev['voiceprints'] = $voiceprints;
+                        }
+
+                        // CRITICAL: Do NOT overwrite an existing primary voiceprint during intro enrollment.
+                        // If the same name is detected again due to bleed/duplicate phrases, we only append
+                        // templates to `voiceprints[]` and keep the first stable `voiceprint`.
+                        if ($hasNewVoiceprint && is_array($prev['voiceprint'] ?? null) && count((array) ($prev['voiceprint'] ?? [])) >= 32) {
+                            unset($enrolledEmbedding['voiceprint'], $enrolledEmbedding['voiceprint_dim']);
+                        }
+
                         $named->update([
-                            'voice_embedding' => array_merge(
-                                is_array($named->voice_embedding) ? $named->voice_embedding : [],
-                                $enrolledEmbedding,
-                            ),
+                            'voice_embedding' => array_merge($prev, $enrolledEmbedding),
                         ]);
                     }
 
@@ -751,19 +869,49 @@ class ProcessChunkJob implements ShouldQueue
         $process->run();
 
         if (!$process->isSuccessful()) {
+            Log::warning('intro_voiceprint_compute_failed', [
+                'meeting_id' => $this->meetingId,
+                'chunk_index' => $this->chunkIndex,
+                'mode' => $this->mode,
+                'python' => $python,
+                'script' => $script,
+                'file' => $absolutePath,
+                'exit_code' => $process->getExitCode(),
+                'error_output' => trim((string) $process->getErrorOutput()),
+                'output' => trim((string) $process->getOutput()),
+            ]);
             return null;
         }
 
         $decoded = json_decode((string) $process->getOutput(), true);
         if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
+            Log::warning('intro_voiceprint_compute_invalid_json', [
+                'meeting_id' => $this->meetingId,
+                'chunk_index' => $this->chunkIndex,
+                'mode' => $this->mode,
+                'python' => $python,
+                'script' => $script,
+                'file' => $absolutePath,
+                'output' => trim((string) $process->getOutput()),
+            ]);
             return null;
         }
 
+        $this->lastVoiceprintEngine = is_string($decoded['engine'] ?? null) ? (string) $decoded['engine'] : null;
         $vec = [];
         foreach ($decoded['embedding'] as $v) {
             if (is_numeric($v)) {
                 $vec[] = (float) $v;
             }
+        }
+        if (count($vec) >= 32) {
+            Log::info('intro_voiceprint_compute_ok', [
+                'meeting_id' => $this->meetingId,
+                'chunk_index' => $this->chunkIndex,
+                'mode' => $this->mode,
+                'dim' => count($vec),
+                'engine' => is_string($decoded['engine'] ?? null) ? (string) $decoded['engine'] : null,
+            ]);
         }
         return count($vec) > 0 ? $vec : null;
     }
@@ -778,9 +926,13 @@ class ProcessChunkJob implements ShouldQueue
             ->whereNotNull('voice_embedding')
             ->get(['id', 'voice_embedding']);
 
+        $expectedDim = (int) env('MEETING_VOICEPRINT_EXPECTED_DIM', 192);
+        $expectedDim = max(32, min(2048, $expectedDim));
+
         $out = [];
         foreach ($rows as $p) {
             $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
+            $engine = strtolower(trim((string) ($ve['voiceprint_engine'] ?? $ve['engine'] ?? '')));
             $vec = $ve['voiceprint'] ?? null;
             if (!is_array($vec) || count($vec) < 32) {
                 continue;
@@ -791,7 +943,16 @@ class ProcessChunkJob implements ShouldQueue
                     $floats[] = (float) $v;
                 }
             }
-            if (count($floats) < 32) {
+            $dim = count($floats);
+            if ($dim < 32) {
+                continue;
+            }
+            // Only match against ECAPA voiceprints (prevents mixing old Resemblyzer templates).
+            // If engine isn't stored (legacy rows), fall back to expected dimension check.
+            if ($engine !== '' && $engine !== 'speechbrain_ecapa') {
+                continue;
+            }
+            if ($engine === '' && $expectedDim > 0 && $dim !== $expectedDim) {
                 continue;
             }
             $out[] = [
@@ -836,18 +997,43 @@ class ProcessChunkJob implements ShouldQueue
     private function matchVoiceprint(array $vec, array $enrolled): ?array
     {
         $threshold = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
-        $bestId = null;
-        $bestScore = -1.0;
+        $minMargin = (float) (env('MEETING_VOICEPRINT_MARGIN', 0.05));
+
+        // Participants can have multiple templates. Compare by "best score per participant"
+        // so second-best is truly another participant (not the same participant's 2nd template).
+        $bestByPid = [];
         foreach ($enrolled as $e) {
-            $score = $this->cosineSimilarity($vec, $e['vector']);
-            if ($score > $bestScore) {
-                $bestScore = $score;
-                $bestId = (int) $e['participant_id'];
+            $pid = (int) ($e['participant_id'] ?? 0);
+            if ($pid <= 0) {
+                continue;
+            }
+            $vec2 = $e['vector'] ?? null;
+            if (!is_array($vec2) || count($vec2) < 32) {
+                continue;
+            }
+            $score = $this->cosineSimilarity($vec, $vec2);
+            if (!isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+                $bestByPid[$pid] = (float) $score;
             }
         }
-        if ($bestId === null || $bestScore < $threshold) {
+
+        if (count($bestByPid) === 0) {
             return null;
         }
+
+        arsort($bestByPid);
+        $bestId = (int) array_key_first($bestByPid);
+        $vals = array_values($bestByPid);
+        $bestScore = (float) ($vals[0] ?? -1.0);
+        $secondBest = (float) ($vals[1] ?? -1.0);
+
+        if ($bestId <= 0 || $bestScore < $threshold) {
+            return null;
+        }
+        if (($bestScore - max(-1.0, $secondBest)) < $minMargin) {
+            return null;
+        }
+
         return [$bestId, $bestScore];
     }
 

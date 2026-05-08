@@ -3,9 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Meeting;
 use App\Models\MeetingAnalytic;
 use App\Models\MeetingParticipant;
-use App\Models\ParticipantStat;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -37,41 +37,49 @@ class AnalyticsController extends Controller
             ->get()
             ->keyBy('participant_id');
 
-        $participantIds = $statsRows->keys()->map(fn ($id) => (int) $id)->values();
-
-        $participants = MeetingParticipant::query()
-            ->whereIn('id', $participantIds)
-            ->get(['id', 'name', 'voice_embedding'])
-            ->keyBy('id');
-
+        $meeting = Meeting::query()->find($meetingId);
+        $meetingDurationSec = max(0, (int) ($meeting?->duration ?? 0));
         $totalTalkTime = (int) $statsRows->sum(fn ($r) => (int) ($r->talk_time ?? 0));
+        $useMeetingDurationPct = $periodStart === null && $meetingDurationSec > 0;
 
-        $stats = $statsRows
-            ->map(function ($row, $participantId) use ($participants, $totalTalkTime) {
-                $participant = $participants->get((int) $participantId);
+        $enrolled = MeetingParticipant::query()
+            ->where('meeting_id', $meetingId)
+            ->get(['id', 'name', 'voice_embedding'])
+            ->filter(fn ($p) => ! $this->isPlaceholder((string) $p->name))
+            ->values();
 
-                if (!$participant || $this->isPlaceholder((string) $participant->name)) {
-                    return null;
-                }
-
+        $stats = $enrolled
+            ->map(function (MeetingParticipant $participant) use ($statsRows, $totalTalkTime, $useMeetingDurationPct, $meetingDurationSec) {
+                $row = $statsRows->get((int) $participant->id);
                 $talkTime = (int) ($row->talk_time ?? 0);
-                $talkPercentage = $totalTalkTime > 0 ? ($talkTime / $totalTalkTime) * 100 : 0;
+                $timesSpoken = (int) ($row->times_spoken ?? 0);
+
+                if ($useMeetingDurationPct) {
+                    $talkPercentage = min(100.0, max(0.0, ($talkTime / $meetingDurationSec) * 100));
+                } else {
+                    $talkPercentage = $totalTalkTime > 0 ? ($talkTime / $totalTalkTime) * 100 : 0.0;
+                }
 
                 $voiceEmbedding = $participant->voice_embedding;
                 $provider = is_array($voiceEmbedding) ? ($voiceEmbedding['provider'] ?? null) : null;
 
                 return [
-                    'participant_id'  => (int) $participantId,
-                    'name'            => (string) $participant->name,
-                    'talk_time'       => $talkTime,
-                    'talk_percentage' => (float) $talkPercentage,
-                    'times_spoken'    => (int) ($row->times_spoken ?? 0),
-                    'provider'        => $provider,
+                    'participant_id'    => (int) $participant->id,
+                    'name'              => (string) $participant->name,
+                    'talk_time'         => $talkTime,
+                    'talk_percentage'   => (float) round($talkPercentage, 2),
+                    'times_spoken'      => $timesSpoken,
+                    'provider'          => $provider,
                 ];
             })
-            ->filter()
-            ->sortByDesc('talk_time')
-            ->values();
+            ->values()
+            ->all();
+
+        usort($stats, function (array $a, array $b): int {
+            $c = ($b['talk_time'] ?? 0) <=> ($a['talk_time'] ?? 0);
+
+            return $c !== 0 ? $c : strcmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? ''));
+        });
 
         $analyticQuery = MeetingAnalytic::query()->where('meeting_id', $meetingId);
         if ($periodStart !== null) {
@@ -82,7 +90,7 @@ class AnalyticsController extends Controller
         return response()->json([
             'participants'         => $stats,
             'crosstalk_percentage' => (float) ($analytic?->crosstalk_percentage ?? 0),
-            'total_speakers'       => (int) ($analytic?->total_speakers ?? $stats->count()),
+            'total_speakers'       => (int) ($analytic?->total_speakers ?? count($stats)),
             'keywords'             => $analytic?->keywords ?? [],
             'summary'              => $analytic?->summary ?? '',
             'action_items'         => $analytic?->action_items ?? [],
@@ -115,6 +123,6 @@ class AnalyticsController extends Controller
 
     private function isPlaceholder(string $name): bool
     {
-        return (bool) preg_match('/^(Speaker\s+\d+|speaker_\d+|chunk\d+_\S+)$/i', $name);
+        return (bool) preg_match('/^(Speaker\s+\d+|speaker_\d+|speaker_unknown|chunk\d+_\S+)$/i', trim($name));
     }
 }
