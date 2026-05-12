@@ -13,6 +13,8 @@ use App\Http\Controllers\Admin\SettingController;
 use App\Http\Controllers\Admin\FaqController;
 use App\Http\Controllers\Admin\SystemController;
 use App\Http\Controllers\Admin\PaymentController;
+use App\Http\Controllers\Admin\AdminAccountDeletionController;
+use App\Http\Controllers\PublicDeleteAccountController;
 use App\Models\Faq;
 
 Route::get('/', function () {
@@ -36,6 +38,30 @@ Route::get('/faqs', function () {
 
     return view('faqs', ['faqs' => $faqs]);
 });
+
+Route::get('/legal/{type}', function (string $type) {
+    if (!in_array($type, ['privacy', 'terms', 'about'], true)) {
+        abort(404);
+    }
+    $page = \App\Models\Page::query()->where('type', $type)->firstOrFail();
+
+    return response()->view('public.legal-simple', [
+        'title' => $page->title,
+        'content' => $page->content,
+    ]);
+})->name('public.legal');
+
+// Public account deletion (browser): GET http://localhost:8000/delete-account when APP_URL=http://localhost:8000
+Route::middleware('throttle:delete-account-otp')->group(function () {
+    Route::post('/delete-account/send-otp', [PublicDeleteAccountController::class, 'sendOtp'])->name('delete-account.send-otp');
+    Route::post('/delete-account/verify-otp', [PublicDeleteAccountController::class, 'verifyOtp'])->name('delete-account.verify-otp');
+});
+
+Route::middleware('throttle:public-delete-account')->group(function () {
+    Route::get('/delete-account', [PublicDeleteAccountController::class, 'show'])->name('delete-account.show');
+    Route::post('/delete-account', [PublicDeleteAccountController::class, 'submit'])->name('delete-account.submit');
+});
+Route::get('/delete-account/success', [PublicDeleteAccountController::class, 'success'])->name('delete-account.success');
 
 Route::prefix('admin')->group(function () {
     // (UI only for now; real auth wiring can come later)
@@ -111,6 +137,11 @@ Route::prefix('admin')->group(function () {
         Route::post('/faqs', [FaqController::class, 'store'])->name('admin.faqs.store');
         Route::put('/faqs/{faq}', [FaqController::class, 'update'])->name('admin.faqs.update');
         Route::delete('/faqs/{faq}', [FaqController::class, 'destroy'])->name('admin.faqs.destroy');
+
+        Route::get('/account-deletion-requests', [AdminAccountDeletionController::class, 'index'])->name('admin.account-deletion-requests.index');
+        Route::post('/account-deletion-requests/{account_deletion_request}/approve', [AdminAccountDeletionController::class, 'approve'])->name('admin.account-deletion-requests.approve');
+        Route::post('/account-deletion-requests/{account_deletion_request}/reject', [AdminAccountDeletionController::class, 'reject'])->name('admin.account-deletion-requests.reject');
+        Route::post('/account-deletion-requests/{account_deletion_request}/delete-user', [AdminAccountDeletionController::class, 'deleteUser'])->name('admin.account-deletion-requests.delete-user');
 
         // Logs / performance
         Route::get('/logs', [SystemController::class, 'logs'])->name('admin.logs');

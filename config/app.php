@@ -123,4 +123,11 @@ return [
         'store' => env('APP_MAINTENANCE_STORE', 'database'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Public support contact (account deletion page, etc.)
+    |--------------------------------------------------------------------------
+    */
+    'support_email' => env('SUPPORT_EMAIL'),
+
 ];

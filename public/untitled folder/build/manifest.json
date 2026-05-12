@@ -1,0 +1,109 @@
+{
+  "_axios-1xhT7Gji.js": {
+    "file": "assets/axios-1xhT7Gji.js",
+    "name": "axios"
+  },
+  "resources/css/admin.css": {
+    "file": "assets/admin-C34JldoA.css",
+    "name": "admin",
+    "names": [
+      "admin.css"
+    ],
+    "src": "resources/css/admin.css",
+    "isEntry": true
+  },
+  "resources/css/app.css": {
+    "file": "assets/app-BQTudTns.css",
+    "name": "app",
+    "names": [
+      "app.css"
+    ],
+    "src": "resources/css/app.css",
+    "isEntry": true
+  },
+  "resources/js/admin.js": {
+    "file": "assets/admin-CmfVyPXM.js",
+    "name": "admin",
+    "src": "resources/js/admin.js",
+    "isEntry": true,
+    "imports": [
+      "_axios-1xhT7Gji.js"
+    ],
+    "dynamicImports": [
+      "resources/js/admin/components/map.js",
+      "resources/js/admin/components/chart/chart-1.js",
+      "resources/js/admin/components/chart/chart-2.js",
+      "resources/js/admin/components/chart/chart-3.js",
+      "resources/js/admin/components/chart/chart-6.js",
+      "resources/js/admin/components/chart/chart-8.js",
+      "resources/js/admin/components/chart/chart-13.js",
+      "resources/js/admin/components/calendar-init.js"
+    ],
+    "css": [
+      "assets/admin-CveviJq_.css"
+    ]
+  },
+  "resources/js/admin/components/calendar-init.js": {
+    "file": "assets/calendar-init-D58yY8j0.js",
+    "name": "calendar-init",
+    "src": "resources/js/admin/components/calendar-init.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/admin.js"
+    ]
+  },
+  "resources/js/admin/components/chart/chart-1.js": {
+    "file": "assets/chart-1-D5Q-aElA.js",
+    "name": "chart-1",
+    "src": "resources/js/admin/components/chart/chart-1.js",
+    "isDynamicEntry": true
+  },
+  "resources/js/admin/components/chart/chart-13.js": {
+    "file": "assets/chart-13-BBDDCG7f.js",
+    "name": "chart-13",
+    "src": "resources/js/admin/components/chart/chart-13.js",
+    "isDynamicEntry": true
+  },
+  "resources/js/admin/components/chart/chart-2.js": {
+    "file": "assets/chart-2-BMxUvXXZ.js",
+    "name": "chart-2",
+    "src": "resources/js/admin/components/chart/chart-2.js",
+    "isDynamicEntry": true
+  },
+  "resources/js/admin/components/chart/chart-3.js": {
+    "file": "assets/chart-3-CRgxP-N9.js",
+    "name": "chart-3",
+    "src": "resources/js/admin/components/chart/chart-3.js",
+    "isDynamicEntry": true
+  },
+  "resources/js/admin/components/chart/chart-6.js": {
+    "file": "assets/chart-6-CeEJRRyq.js",
+    "name": "chart-6",
+    "src": "resources/js/admin/components/chart/chart-6.js",
+    "isDynamicEntry": true
+  },
+  "resources/js/admin/components/chart/chart-8.js": {
+    "file": "assets/chart-8-CqklzU0Q.js",
+    "name": "chart-8",
+    "src": "resources/js/admin/components/chart/chart-8.js",
+    "isDynamicEntry": true
+  },
+  "resources/js/admin/components/map.js": {
+    "file": "assets/map-BG4dGz4N.js",
+    "name": "map",
+    "src": "resources/js/admin/components/map.js",
+    "isDynamicEntry": true,
+    "css": [
+      "assets/map-Ce5p-iuE.css"
+    ]
+  },
+  "resources/js/app.js": {
+    "file": "assets/app-DXJbS0hB.js",
+    "name": "app",
+    "src": "resources/js/app.js",
+    "isEntry": true,
+    "imports": [
+      "_axios-1xhT7Gji.js"
+    ]
+  }
+}

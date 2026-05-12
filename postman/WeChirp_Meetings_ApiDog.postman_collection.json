@@ -1,0 +1,571 @@
+{
+  "info": {
+    "_postman_id": "a7f3c2d1-4e5b-6a7c-8d9e-0f1a2b3c4d5e",
+    "name": "WeChirp — meetings (API Dog)",
+    "description": "Meeting realtime APIs: audio chunks, intro enrollment, stats (incl. SSE), speaker mapping, transcripts. Form fields match Laravel `AudioChunkController`, `IntroChunkController`, etc.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "meetings",
+      "description": "Protected meeting endpoints (`api.auth`). Use `Authorization: Bearer {{token}}` from login; collection-level variables: `baseUrl`, `token`, `meetingId`.",
+      "item": [
+        {
+          "name": "upload audio chunk",
+          "description": "Realtime audio chunk upload used for live transcription and streaming speech processing. **Body:** `meeting_id`, `chunk_index`, file field **`audio`** (optional; queued either way). Returns **202** with `status: queued`.",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "meeting_id",
+                  "value": "{{meetingId}}",
+                  "type": "text",
+                  "description": "Meeting ID (integer)"
+                },
+                {
+                  "key": "chunk_index",
+                  "value": "5",
+                  "type": "text",
+                  "description": "Zero-based chunk sequence"
+                },
+                {
+                  "key": "audio",
+                  "type": "file",
+                  "src": "",
+                  "description": "Audio file (e.g. wav/webm); max 51200 KB per validation"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/audio/chunk",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "audio", "chunk"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "audio-chunk-202",
+              "name": "Chunk queued",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "body": {
+                  "mode": "formdata",
+                  "formdata": []
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/api/audio/chunk",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "audio", "chunk"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": \"queued\",\n  \"meeting_id\": 1,\n  \"chunk_index\": 5\n}"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        },
+        {
+          "name": "upload intro chunk",
+          "description": "Intro enrollment audio chunks for speaker recognition and voice embedding generation. **Required:** `chunk_index`, **`audio`** (file). Optional: `duration_seconds`. Query **`sync=1`** runs inline (no queue worker). Async returns **202** `status: queued`; sync success returns enrolled participants.",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "chunk_index",
+                  "value": "0",
+                  "type": "text",
+                  "description": "Zero-based intro chunk index"
+                },
+                {
+                  "key": "audio",
+                  "type": "file",
+                  "src": "",
+                  "description": "Intro audio file"
+                },
+                {
+                  "key": "duration_seconds",
+                  "value": "4.5",
+                  "type": "text",
+                  "description": "Optional; 1–60",
+                  "disabled": true
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/intro/chunk",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "meetings", "{{meetingId}}", "intro", "chunk"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "intro-chunk-202",
+              "name": "Intro chunk queued (async)",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "body": {
+                  "mode": "formdata",
+                  "formdata": []
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/intro/chunk",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "intro", "chunk"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": \"queued\",\n  \"meeting_id\": 1,\n  \"chunk_index\": 0,\n  \"mode\": \"intro\"\n}"
+            },
+            {
+              "id": "intro-chunk-200-sync",
+              "name": "Intro chunk completed (sync=1)",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "body": {
+                  "mode": "formdata",
+                  "formdata": []
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/intro/chunk?sync=1",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "intro", "chunk"],
+                  "query": [
+                    {
+                      "key": "sync",
+                      "value": "1"
+                    }
+                  ],
+                  "variable": []
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": \"completed\",\n  \"meeting_id\": 1,\n  \"chunk_index\": 0,\n  \"mode\": \"intro\",\n  \"enrolled_participants\": [\n    {\n      \"id\": 12,\n      \"name\": \"Rajat\",\n      \"voice_embedding\": null\n    }\n  ]\n}"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        },
+        {
+          "name": "get meeting stats",
+          "description": "Fetch realtime meeting analytics from DB (`ParticipantStat`, `MeetingAnalytic`). Host-only; returns `participants` talk breakdown and `crosstalk_percentage`.",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {},
+            "url": {
+              "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "meetings", "{{meetingId}}", "stats"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "meeting-stats-200",
+              "name": "Meeting stats",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/stats",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "stats"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"meeting_id\": 1,\n  \"total_participants\": 3,\n  \"participants\": [\n    {\n      \"participant_id\": 12,\n      \"name\": \"Rajat\",\n      \"talk_time\": 120,\n      \"talk_percentage\": 45.2,\n      \"times_spoken\": 8\n    }\n  ],\n  \"crosstalk_percentage\": 3.5,\n  \"updated_at\": \"2026-05-11T10:15:30.000000Z\",\n  \"source\": \"db\"\n}"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        },
+        {
+          "name": "stream meeting stats",
+          "description": "Server-Sent Events stream for live stats. Events: `stats.updated` with JSON payload; comment lines `: keepalive` for proxies. **EventSource** cannot send `Authorization`; for browser testing append `?token={{token}}` (Sanctum personal access token).",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream",
+                "type": "text"
+              }
+            ],
+            "body": {},
+            "url": {
+              "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/stats/stream",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "meetings", "{{meetingId}}", "stats", "stream"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "stats-sse-sample",
+              "name": "SSE stats.updated",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/stats/stream",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "stats", "stream"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/event-stream"
+                }
+              ],
+              "cookie": [],
+              "body": "event: stats.updated\ndata: {\"meeting_id\":1,\"total_participants\":3,\"participants\":[{\"participant_id\":12,\"name\":\"Rajat\",\"talk_time\":120,\"talk_percentage\":45.2,\"times_spoken\":8}],\"crosstalk_percentage\":3.5,\"updated_at\":\"2026-05-11T10:15:30.000000Z\"}\n\n: keepalive\n\n"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        },
+        {
+          "name": "get speakers",
+          "description": "List `SpeakerMapping` rows for the meeting (with `participant` relation).",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {},
+            "url": {
+              "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/speakers",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "meetings", "{{meetingId}}", "speakers"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "speakers-list-200",
+              "name": "Speakers list",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/speakers",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "speakers"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": true,\n  \"data\": [\n    {\n      \"id\": 1,\n      \"meeting_id\": 1,\n      \"speaker_label\": \"speaker_0\",\n      \"participant_id\": 12,\n      \"confidence\": 0.92,\n      \"participant\": {\n        \"id\": 12,\n        \"name\": \"Rajat\"\n      }\n    }\n  ]\n}"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        },
+        {
+          "name": "map speakers",
+          "description": "Map a diarized `speaker_label` to a `participant_id` and/or `name` (creates participant if needed). Optional: `confidence` (0–1).",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"speaker_label\": \"speaker_0\",\n  \"participant_id\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/speakers/map",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "meetings", "{{meetingId}}", "speakers", "map"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "speakers-map-200",
+              "name": "Speaker mapped",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"speaker_label\": \"speaker_0\",\n  \"participant_id\": 1\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/speakers/map",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "speakers", "map"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": true,\n  \"data\": {\n    \"mapping\": {\n      \"id\": 1,\n      \"meeting_id\": 1,\n      \"speaker_label\": \"speaker_0\",\n      \"participant_id\": 1,\n      \"confidence\": null\n    },\n    \"participant\": {\n      \"id\": 1,\n      \"meeting_id\": 1,\n      \"user_id\": null,\n      \"name\": \"Rajat\",\n      \"voice_embedding\": null\n    }\n  }\n}"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        },
+        {
+          "name": "get transcripts",
+          "description": "Returns the latest **50** transcript rows for the meeting (`id`, `text`, `start_time`, `end_time`, `created_at`).",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {},
+            "url": {
+              "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/transcripts",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "meetings", "{{meetingId}}", "transcripts"],
+              "query": [],
+              "variable": []
+            }
+          },
+          "response": [
+            {
+              "id": "transcripts-200",
+              "name": "Transcripts list",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/meetings/{{meetingId}}/transcripts",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "meetings", "{{meetingId}}", "transcripts"],
+                  "query": [],
+                  "variable": []
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"meeting_id\": 1,\n  \"items\": [\n    {\n      \"id\": 101,\n      \"text\": \"Welcome everyone\",\n      \"start_time\": 5.2,\n      \"end_time\": 7.8,\n      \"created_at\": \"2026-05-11T10:00:05.000000Z\"\n    }\n  ]\n}"
+            }
+          ],
+          "protocolProfileBehavior": {
+            "strictSSL": false,
+            "followRedirects": true
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "meetingId",
+      "value": "1"
+    }
+  ]
+}

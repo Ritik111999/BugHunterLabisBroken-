@@ -1,0 +1,210 @@
+{
+  "info": {
+    "_postman_id": "a7f3c2d1-4e8b-4c1a-9f2d-6b5e4a3c2d10",
+    "name": "WeChirp — Account deletion",
+    "description": "Public JSON API, browser web page, and authenticated app deletion.\n\n**Web form (browser):** `GET {{baseUrl}}/delete-account` — e.g. **http://localhost:8000/delete-account** when `php artisan serve` and `APP_URL=http://localhost:8000`.\n\n**Variables:** `baseUrl` (default http://localhost:8000), `token` (Bearer for app folder — run **Login** first or paste a Sanctum token).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Web (browser)",
+      "description": "HTML form at `/delete-account` (session + CSRF + OTP). Open **http://localhost:8000/delete-account** in a browser for real use. Postman GET is only for quick checks.",
+      "item": [
+        {
+          "name": "Delete account page",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/delete-account",
+            "description": "Public form: **http://localhost:8000/delete-account** with default `php artisan serve` and `APP_URL=http://localhost:8000`."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete account — success page",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/delete-account/success",
+            "description": "Shown after submit; normally requires session flash from POST. Direct GET redirects back to the form if session is empty."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Public API",
+      "description": "No authentication. Rate-limited (10/min per IP by default). Email must belong to an active (non–soft-deleted) user.",
+      "item": [
+        {
+          "name": "Submit delete account request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/public/delete-account-request",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Rajat\",\n  \"email\": \"user@wechirp.local\",\n  \"phone\": \"\",\n  \"reason\": \"No longer using the app\"\n}"
+            },
+            "description": "Creates a web-sourced deletion request. Returns 201 with `{ success, message }` on success. 422 validation / 409 if a pending request already exists for this email."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "App — Account deletion",
+      "description": "Bearer token required (`Authorization: Bearer {{token}}`). Use **Login** first to store `token` on this collection.",
+      "item": [
+        {
+          "name": "Login (set collection token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "try {",
+                  "  const json = pm.response.json();",
+                  "  const t = json && json.data && json.data.token ? json.data.token : (json && json.token ? json.token : null);",
+                  "  if (t) {",
+                  "    pm.collectionVariables.set('token', t);",
+                  "    console.log('Collection token set from login response');",
+                  "  }",
+                  "} catch (e) { console.warn(e); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@wechirp.local\",\n  \"password\": \"user12345\"\n}"
+            },
+            "description": "Prerequisite for the requests below. Adjust email/password to match your database. Saves `token` to collection variables on success."
+          },
+          "response": []
+        },
+        {
+          "name": "Request account deletion",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/account/delete-request",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Deleting from mobile app\"\n}"
+            },
+            "description": "Creates an app-sourced deletion request. Optional `reason`. 201 `{ success, message }`. 409 if a pending request already exists."
+          },
+          "response": []
+        },
+        {
+          "name": "Deletion request status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/account/delete-request/status",
+            "description": "Returns `{ success, data: { status, requested_at, source }, message }`. `status` may be `none`, `pending`, `approved`, `rejected`, or `cancelled`."
+          },
+          "response": []
+        },
+        {
+          "name": "Cancel deletion request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/account/delete-request/cancel",
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "description": "Cancels the current user's pending deletion request. 200 `{ success, message }` or 404 if nothing pending."
+          },
+          "response": []
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/logout",
+            "description": "Revokes the current access token (call after successful delete request from the app)."
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "token",
+      "value": ""
+    }
+  ]
+}

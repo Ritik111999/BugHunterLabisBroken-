@@ -19,6 +19,8 @@ use App\Http\Controllers\Api\TranscriptController;
 use App\Http\Controllers\Api\IntroChunkController;
 use App\Http\Controllers\Api\InAppPurchaseController;
 use App\Http\Controllers\Api\SubscriptionPlanController;
+use App\Http\Controllers\Api\AccountDeletionController;
+use App\Http\Controllers\Api\PublicDeleteAccountController as ApiPublicDeleteAccountController;
 
 use Illuminate\Support\Facades\Route;
 
@@ -42,6 +44,10 @@ Route::get('/pages/{type}', [PageController::class, 'show']);
 Route::get('/faqs', [FaqController::class, 'index']);
 Route::get('/subscription-plans', [SubscriptionPlanController::class, 'index']);
 
+Route::middleware('throttle:public-delete-account')->group(function () {
+    Route::post('/public/delete-account-request', [ApiPublicDeleteAccountController::class, 'store']);
+});
+
 
 /*
 |--------------------------------------------------------------------------
@@ -56,11 +62,15 @@ Route::middleware('api.auth')->group(function () {
     | Auth & Profile
     |----------------------------------
     */
-    Route::post('/logout', [AuthController::class, 'logout']);
+    Route::post('/logout', [AuthController::class, 'logout'])->name('api.logout');
 
     Route::get('/profile', [ProfileController::class, 'profile']);
     Route::post('/profile/update', [ProfileController::class, 'update']);
     Route::post('/profile/change-password', [ProfileController::class, 'changePassword']);
+
+    Route::post('/account/delete-request', [AccountDeletionController::class, 'store']);
+    Route::get('/account/delete-request/status', [AccountDeletionController::class, 'status']);
+    Route::post('/account/delete-request/cancel', [AccountDeletionController::class, 'cancel']);
 
     /*
     |----------------------------------

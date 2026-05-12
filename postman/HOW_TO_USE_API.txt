@@ -1,0 +1,197 @@
+WeChirp API — simple usage guide (all routes)
+=============================================
+All paths below use your server root + /api/...
+Example: if baseUrl is http://127.0.0.1:8000 then login is
+  POST http://127.0.0.1:8000/api/login
+
+PUBLIC (no login token needed)
+------------------------------
+POST /signup
+  When: New user creates an account.
+  Where: Registration screen in the app.
+
+POST /login
+  When: User signs in.
+  Where: Login screen. Save the token you get; you need it for protected routes.
+
+POST /send-otp
+  When: User forgot password and asks for a code by email/SMS.
+  Where: Forgot-password flow, first step.
+
+POST /verify-otp
+  When: User enters the code they received.
+  Where: Forgot-password flow, second step.
+
+POST /reset-password
+  When: After OTP is verified, user sets a new password.
+  Where: Forgot-password flow, final step.
+
+GET /pages/{type}
+  When: App needs static page content (legal, about, etc.) by type slug.
+  Where: CMS-driven screens that load HTML or structured page data from the server.
+
+GET /faqs
+  When: Show the list of frequently asked questions.
+  Where: Help / FAQ screen.
+
+GET /subscription-plans
+  When: Show available subscription plans before purchase.
+  Where: Paywall or upgrade / pricing screen.
+
+
+PROTECTED (send Authorization: Bearer YOUR_TOKEN on every request)
+-------------------------------------------------------------------
+General rule: Put the token from login in the header, or set it in Postman/API Dog as {{token}}.
+
+--- Auth & profile ---
+POST /logout
+  When: User taps sign out.
+  Where: Settings or profile menu.
+
+GET /profile
+  When: Load the logged-in user’s profile.
+  Where: Profile or account screen.
+
+POST /profile/update
+  When: User changes name, photo, or other profile fields.
+  Where: Edit profile screen.
+
+POST /profile/change-password
+  When: User knows old password and wants a new one (while logged in).
+  Where: Security / change password screen.
+
+POST /contact
+  When: User submits a contact or support form.
+  Where: Contact us / support form.
+
+--- Meetings (lifecycle) ---
+GET /meetings
+  When: Show the user’s list of meetings.
+  Where: Home or meetings list screen.
+
+POST /meetings
+  When: User creates a new meeting (title, etc.).
+  Where: “New meeting” or schedule flow.
+
+GET /meetings/{id}
+  When: Show details for one meeting.
+  Where: Meeting detail or lobby screen.
+
+POST /meetings/{id}/start
+  When: Host starts the meeting (recording/live session begins).
+  Where: Start meeting button.
+
+POST /meetings/{id}/end
+  When: Host ends the meeting.
+  Where: End meeting button.
+
+DELETE /meetings/{id}
+  When: User deletes a meeting.
+  Where: Delete / trash action on meeting detail or list.
+
+--- Participants ---
+POST /participants
+  When: Add a person to a meeting with voice data (intro enrollment path that creates participant with embedding).
+  Where: Intro step or “add participant” flow.
+
+GET /meetings/{id}/participants
+  When: List everyone in that meeting.
+  Where: Participant list before or during the meeting.
+
+--- Audio ---
+POST /audio/upload
+  When: Upload a full audio file (not chunked) for processing.
+  Where: Upload-after-meeting or import recording flow.
+
+POST /audio/chunk
+  When: During a live meeting, sending short pieces of audio one after another.
+  Where: Live recorder / streaming client.
+
+POST /meetings/{id}/intro/chunk
+  When: Sending intro clips so the app can learn voices (names from intro pipeline).
+  Where: Per-person intro recording step.
+
+--- Results & live data ---
+GET /meetings/{id}/analytics
+  When: After the meeting, show final analytics summary.
+  Where: Meeting summary / report screen.
+
+GET /meetings/{id}/stats
+  When: You want current numbers once (talk time, crosstalk snapshot).
+  Where: Refresh stats or one-time dashboard load.
+
+GET /meetings/{id}/stats/stream
+  When: Dashboard should update live without polling.
+  Where: Live meeting dashboard (SSE). Browsers may need ?token= for EventSource.
+
+GET /meetings/{id}/speakers
+  When: Show which automatic speaker labels map to which people.
+  Where: Speaker labeling UI.
+
+POST /meetings/{id}/speakers/map
+  When: User links “speaker_0” (etc.) to a real participant or name.
+  Where: Confirm speaker identity screen.
+
+GET /meetings/{id}/transcripts
+  When: Show recent transcribed lines for the meeting.
+  Where: Live captions history or transcript panel.
+
+--- In-app purchase (subscription) ---
+POST /iap/subscription/activate
+  When: App store says purchase succeeded; you tell the backend to turn the subscription on.
+  Where: After successful Apple/Google purchase verification.
+
+POST /iap/subscription/restore
+  When: User taps “restore purchases” on a new device.
+  Where: Subscription settings / restore flow.
+
+GET /iap/subscription/status
+  When: App needs to know if the user is currently subscribed.
+  Where: Before premium features, or on account / billing screen.
+
+
+WebSocket (live audio — not the same as /api)
+---------------------------------------------
+This is separate from the REST URLs above. The app starts a small WebSocket server (the
+“Deepgram relay”) that is not Laravel’s normal http://.../api/... port.
+
+What it is for
+  Real-time meeting audio: the phone or browser opens a WebSocket, sends binary audio
+  frames, and the relay forwards to Deepgram Live and updates the database (stats,
+  transcripts, etc.). Use this when you want the lowest delay live path instead of only
+  POST /api/audio/chunk.
+
+How to run the relay (on your machine or server)
+  From the Laravel project folder:
+    php artisan deepgram:relay
+  Default in code is host 127.0.0.1 and port 8082 (you can change it):
+    php artisan deepgram:relay --host=127.0.0.1 --port=8082
+
+How to connect (URL pattern)
+  ws://HOST:PORT/meetings/{meetingId}/live?token=YOUR_LOGIN_TOKEN
+  Example on your laptop with defaults:
+    ws://127.0.0.1:8082/meetings/5/live?token=paste_token_from_login
+  Use wss:// instead of ws:// when everything is on HTTPS in production.
+
+What the client must do
+  1. User must already be logged in so you have the same API token (Sanctum token).
+  2. Open the WebSocket to the URL above (replace meetingId and token).
+  3. Send audio as binary messages (small chunks), as your app’s recorder produces them.
+  4. Handle incoming messages from the server according to your frontend code (live
+     transcripts, etc.).
+
+How to try in Postman
+  WeChirp_API.postman_collection.json includes a “Deepgram Live Relay - WebSocket”
+  request; set the ws URL host/port to match the port you started the relay with.
+
+More detail
+  See wechirp_backend/docs/audio-realtime.md (HTTP chunks vs WebSocket live).
+
+
+How to try in API Dog or Postman
+--------------------------------
+1. Set baseUrl (no trailing slash), e.g. http://127.0.0.1:8000
+2. Call POST /api/login, copy token into variable token
+3. For routes with {id}, set meetingId (or type the id in the URL)
+4. Import WeChirp_Meetings_ApiDog.postman_collection.json for the meeting/realtime set; use WeChirp_API.postman_collection.json or manual requests for the rest
+5. File uploads: chunk and intro endpoints use form field name “audio” for the file (see backend validation)
