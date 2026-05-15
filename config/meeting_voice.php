@@ -88,6 +88,24 @@ return [
     | Meeting start safety
     |--------------------------------------------------------------------------
     */
+    /*
+    |--------------------------------------------------------------------------
+    | Live WebSocket relay (php artisan deepgram:relay)
+    |--------------------------------------------------------------------------
+    */
+    'relay' => [
+        'token_ttl_seconds' => (int) env('MEETING_RELAY_TOKEN_TTL_SECONDS', 900),
+        'max_connections' => (int) env('MEETING_RELAY_MAX_CONNECTIONS', 100),
+        'max_binary_frame_bytes' => (int) env('MEETING_RELAY_MAX_FRAME_BYTES', 65536),
+        'persist_interval_seconds' => (float) env('MEETING_WS_PERSIST_INTERVAL_SECONDS', 8),
+        'upstream_keepalive_seconds' => (float) env('MEETING_RELAY_UPSTREAM_KEEPALIVE_SECONDS', 4),
+        'redis_hot_state' => filter_var(env('MEETING_RELAY_REDIS_HOT_STATE', true), FILTER_VALIDATE_BOOL),
+        'redis_snapshot_ttl_seconds' => (int) env('MEETING_RELAY_REDIS_TTL_SECONDS', 7200),
+        'sticky_sessions_required' => filter_var(env('MEETING_RELAY_STICKY_SESSIONS', true), FILTER_VALIDATE_BOOL),
+        'post_auth_timeout_seconds' => (float) env('MEETING_RELAY_POST_AUTH_TIMEOUT_SECONDS', 5),
+        'pcm_reconnect_buffer_seconds' => (float) env('MEETING_RELAY_PCM_BUFFER_SECONDS', 5),
+    ],
+
     'start' => [
         'duplicate_voiceprint_sim' => (float) env('MEETING_START_DUPLICATE_VOICEPRINT_SIM', 0.972),
         'relax_duplicate_check' => filter_var(env('MEETING_START_RELAX_DUPLICATE_CHECK', false), FILTER_VALIDATE_BOOL),

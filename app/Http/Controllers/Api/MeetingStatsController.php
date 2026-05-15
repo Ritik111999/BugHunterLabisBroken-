@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Meeting;
 use App\Models\MeetingAnalytic;
 use App\Models\ParticipantStat;
+use App\Support\MeetingRelayLiveCache;
 use Illuminate\Http\Request;
 use Laravel\Sanctum\PersonalAccessToken;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -18,6 +19,26 @@ class MeetingStatsController extends Controller
             ->whereKey($id)
             ->where('host_id', auth()->id())
             ->firstOrFail();
+
+        $cached = MeetingRelayLiveCache::getSnapshot((int) $meeting->id);
+        if (is_array($cached) && isset($cached['participants'])) {
+            return response()->json([
+                'meeting_id' => (int) $meeting->id,
+                'total_participants' => (int) ($cached['total_participants'] ?? count($cached['participants'])),
+                'participants' => array_map(function (array $p) {
+                    return [
+                        'participant_id' => (int) ($p['participant_id'] ?? 0),
+                        'name' => (string) ($p['name'] ?? 'Unknown'),
+                        'talk_time' => (int) ($p['talk_time'] ?? 0),
+                        'talk_percentage' => (float) ($p['talk_percentage'] ?? 0),
+                        'times_spoken' => (int) ($p['times_spoken'] ?? 0),
+                    ];
+                }, $cached['participants']),
+                'crosstalk_percentage' => (float) ($cached['crosstalk_percentage'] ?? 0),
+                'updated_at' => $cached['updated_at'] ?? null,
+                'source' => 'relay_cache',
+            ]);
+        }
 
         $stats = ParticipantStat::query()
             ->with('participant:id,name')
@@ -86,6 +107,31 @@ class MeetingStatsController extends Controller
 
             // Stream for up to 10 minutes; client should reconnect if needed.
             while ((time() - $startedAt) < 600) {
+                $cached = MeetingRelayLiveCache::getSnapshot((int) $meeting->id);
+                if (is_array($cached) && isset($cached['participants'])) {
+                    $payload = [
+                        'meeting_id' => (int) $meeting->id,
+                        'total_participants' => (int) ($cached['total_participants'] ?? count($cached['participants'])),
+                        'participants' => $cached['participants'],
+                        'crosstalk_percentage' => (float) ($cached['crosstalk_percentage'] ?? 0),
+                        'updated_at' => $cached['updated_at'] ?? null,
+                        'source' => 'relay_cache',
+                    ];
+                    $fingerprint = md5(json_encode($payload));
+                    if ($fingerprint !== $lastFingerprint) {
+                        $lastFingerprint = $fingerprint;
+                        echo "event: stats.updated\n";
+                        echo 'data: '.json_encode($payload)."\n\n";
+                        flush();
+                    } else {
+                        echo ": keepalive\n\n";
+                        flush();
+                    }
+                    usleep(300000);
+
+                    continue;
+                }
+
                 $analytic = MeetingAnalytic::query()->where('meeting_id', $meeting->id)->first();
                 $stats = ParticipantStat::query()
                     ->with('participant:id,name')

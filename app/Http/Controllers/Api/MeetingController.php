@@ -7,6 +7,8 @@ use App\Jobs\IndexMeetingSearchJob;
 use App\Jobs\SummarizeMeetingJob;
 use App\Models\Meeting;
 use App\Support\LiveTranscriptWriter;
+use App\Support\MeetingRelayLiveCache;
+use App\Support\MeetingRelayTokenService;
 use App\Models\MeetingParticipant;
 use Illuminate\Http\Request;
 
@@ -207,6 +209,8 @@ class MeetingController extends Controller
         ]);
 
         LiveTranscriptWriter::clearMeetingCache((int) $meeting->id);
+        MeetingRelayLiveCache::forget((int) $meeting->id);
+        MeetingRelayTokenService::revokeForMeeting((int) $meeting->id);
         SummarizeMeetingJob::dispatch((int) $meeting->id)->onQueue('default');
         IndexMeetingSearchJob::dispatch((int) $meeting->id)->onQueue('default');
 

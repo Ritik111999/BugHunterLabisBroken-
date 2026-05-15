@@ -7,7 +7,9 @@
         "dev": "vite",
         "dev:ios": "bash scripts/dev-ios-simulator.sh",
         "setup:voiceprint": "bash scripts/setup-voiceprint.sh",
-        "sim:ios-voice-setup": "bash scripts/simulator-voice-intro-setup.sh"
+        "sim:ios-voice-setup": "bash scripts/simulator-voice-intro-setup.sh",
+        "relay:cluster": "bash scripts/run-relay-cluster.sh",
+        "relay:gateway": "node --env-file=.env relay-gateway/server.mjs"
     },
     "devDependencies": {
         "@tailwindcss/vite": "^4.0.0",

@@ -22,10 +22,24 @@ class MeetingServicesHealthController extends Controller
         $relayWsUrl = (string) config('services.wechirp.relay_ws_url');
         $relayHttp = str_replace(['wss://', 'ws://'], ['https://', 'http://'], $relayWsUrl);
 
+        $relayEngine = (string) config('services.wechirp.relay_engine', 'php-amphp');
+
         $relayReachable = false;
+        $relayMetrics = null;
         try {
-            $res = Http::timeout(2)->get(rtrim($relayHttp, '/').'/up');
+            $base = rtrim($relayHttp, '/');
+            $res = Http::timeout(2)->get($base.'/up');
             $relayReachable = $res->successful() && trim((string) $res->body()) === 'ok';
+            if ($relayReachable) {
+                try {
+                    $metricsRes = Http::timeout(2)->get($base.'/metrics');
+                    if ($metricsRes->successful()) {
+                        $relayMetrics = trim((string) $metricsRes->body());
+                    }
+                } catch (\Throwable) {
+                    // optional
+                }
+            }
         } catch (\Throwable) {
             $relayReachable = false;
         }
@@ -65,9 +79,15 @@ class MeetingServicesHealthController extends Controller
             'stt_configured' => $sttConfigured,
             'stt_deepgram_only' => true,
             'relay_ws_url' => $relayWsUrl,
+            'relay_engine' => $relayEngine,
             'relay_host' => $relayHost,
             'relay_port' => $relayPort,
             'relay_reachable' => $relayReachable,
+            'relay_metrics' => $relayMetrics,
+            'relay_sticky_sessions_recommended' => filter_var(
+                config('meeting_voice.relay.sticky_sessions_required', true),
+                FILTER_VALIDATE_BOOL
+            ),
             'ready_for_live_ws' => $sttConfigured && $relayReachable,
             'ready_for_live_http' => $sttConfigured,
             'openai_configured' => $openAiKey !== '',

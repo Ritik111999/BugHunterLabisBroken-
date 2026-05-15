@@ -40,6 +40,13 @@ return [
         'live_model' => env('DEEPGRAM_LIVE_MODEL', 'nova-3'),
     ],
 
+    'relay_gateway' => [
+        'internal_secret' => env('RELAY_INTERNAL_SECRET', ''),
+        'laravel_url' => rtrim((string) env('APP_URL', 'http://127.0.0.1:9000'), '/'),
+        'port' => (int) env('WC_RELAY_GATEWAY_PORT', 9200),
+        'host' => env('WC_RELAY_GATEWAY_HOST', '127.0.0.1'),
+    ],
+
     /*
     | Smallest AI Waves — Pulse STT (WebSocket + HTTP get_text).
     | MEETING_STT_PROVIDER=pulse uses PULSE_API_KEY for live relay + batch analyzer.
@@ -60,13 +67,17 @@ return [
     'wechirp' => [
         'relay_host' => env('WC_RELAY_HOST', '127.0.0.1'),
         'relay_port' => (int) env('WC_RELAY_PORT', 9001),
+        'relay_engine' => strtolower(trim((string) env('WECHIRP_RELAY_ENGINE', 'php-amphp'))),
         'relay_ws_url' => (function (): string {
             $explicit = trim((string) env('WC_RELAY_WS_URL', ''));
             if ($explicit !== '') {
                 return $explicit;
             }
             $host = (string) env('WC_RELAY_HOST', '127.0.0.1');
-            $port = (int) env('WC_RELAY_PORT', 9001);
+            $engine = strtolower(trim((string) env('WECHIRP_RELAY_ENGINE', 'php-amphp')));
+            $port = $engine === 'node'
+                ? (int) env('WC_RELAY_GATEWAY_PORT', 9200)
+                : (int) env('WC_RELAY_PORT', 9001);
             $appUrl = trim((string) env('APP_URL', ''));
             if (str_starts_with($appUrl, 'https://')) {
                 $parsed = parse_url($appUrl);

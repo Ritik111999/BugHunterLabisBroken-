@@ -68,6 +68,14 @@ export class MeetingLiveSession {
         this._liveMicMonitor = null;
         this._transportMode = '';
         this._wsIgnoreClose = false;
+        this._wsFallbackAttempted = false;
+        this._wsReconnectAttempts = 0;
+        this._wsMaxReconnects = 5;
+        this._wsReconnectTimer = null;
+        this._relayWsToken = null;
+        this._upstreamSttConnected = true;
+        this._pcmReconnectQueue = [];
+        this._pcmReconnectMaxFrames = 125;
         this._lastServerTranscriptAt = 0;
     }
 
@@ -116,6 +124,50 @@ export class MeetingLiveSession {
         }
         this._barsEls.clear();
         this._transcriptEls.clear();
+        this.clearWsReconnectTimer();
+    }
+
+    clearWsReconnectTimer() {
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
+    }
+
+    async fetchRelayToken() {
+        try {
+            const res = await this.api(`/meetings/${this.meetingId}/live-token`, { method: 'POST' });
+            const token = String(res?.token || '').trim();
+            if (token) {
+                this._relayWsToken = token;
+                return token;
+            }
+        } catch {
+            // fall back to Sanctum PAT
+        }
+        return this.getToken() || '';
+    }
+
+    stopTranscriptSse() {
+        if (this.state.transcriptSse) {
+            try {
+                this.state.transcriptSse.close();
+            } catch {}
+            this.state.transcriptSse = null;
+        }
+    }
+
+    /** When live on WebSocket, stats + transcript come from the relay only. */
+    stopWsAuxiliaryTransports() {
+        this.stopStatsPolling();
+        this.stopTranscriptPolling();
+        this.stopTranscriptSse();
+        if (this.state.sse) {
+            try {
+                this.state.sse.close();
+            } catch {}
+            this.state.sse = null;
+        }
     }
 
     /**
@@ -902,6 +954,7 @@ export class MeetingLiveSession {
 
     switchToHttpAfterWsFailure() {
         if (!this.state.meeting.running || this._wsFallbackAttempted) return;
+        this.clearWsReconnectTimer();
         this._wsFallbackAttempted = true;
         this._wsIgnoreClose = true;
         try {
@@ -970,15 +1023,14 @@ export class MeetingLiveSession {
             if (useWs) {
                 this.state.ws.useServerAudioClock = false;
                 this._emitTransport('ws', 'Connecting to live relay…');
-                this.startWs();
+                await this.fetchRelayToken();
+                await this.startWs();
                 this.emit('transcriptMode', { text: '' });
                 this.emit('transcriptClear', {});
             } else {
                 this.startHttpLiveTransport();
                 this.emit('transcriptMode', { text: '' });
             }
-            this.startTranscriptSse();
-            this.startTranscriptPolling();
         } catch (e) {
             this.logEvent(`Live start error: ${e?.message ?? e}`);
             throw e;
@@ -1154,10 +1206,54 @@ export class MeetingLiveSession {
         this.emit('transcriptLines', { lines: out });
     }
 
-    startWs() {
-        const token = this.getToken() || '';
+    scheduleWsReconnect(reason = '') {
+        if (!this.state.meeting.running || this._wsFallbackAttempted) return;
+        if (this._wsReconnectAttempts >= this._wsMaxReconnects) {
+            this.logEvent(`WS reconnect exhausted${reason ? ` (${reason})` : ''} — HTTP fallback`);
+            this.emit('wsStatus', { text: 'Switching to HTTP captions…' });
+            this.switchToHttpAfterWsFailure();
+            return;
+        }
+        const delays = [1000, 2000, 4000, 6000, 8000];
+        const delay = delays[Math.min(this._wsReconnectAttempts, delays.length - 1)];
+        const jitter = Math.floor(Math.random() * 400);
+        this._wsReconnectAttempts += 1;
+        this.logEvent(`WS reconnect ${this._wsReconnectAttempts}/${this._wsMaxReconnects} in ${delay + jitter}ms…`);
+        this.emit('wsStatus', { text: `Reconnecting (${this._wsReconnectAttempts}/${this._wsMaxReconnects})…` });
+        this.clearWsReconnectTimer();
+        this._wsReconnectTimer = setTimeout(async () => {
+            this._wsReconnectTimer = null;
+            if (!this.state.meeting.running || this._wsFallbackAttempted) return;
+            const relayBase = this.getRelayWsUrl().trim().replace(/\/$/, '');
+            const up = await this.probeRelay(relayBase);
+            if (!up) {
+                this.scheduleWsReconnect('relay down');
+                return;
+            }
+            try {
+                await this.fetchRelayToken();
+                await this.startWs({ isReconnect: true });
+            } catch (e) {
+                this.logEvent(`WS reconnect failed: ${e?.message ?? e}`);
+                this.scheduleWsReconnect();
+            }
+        }, delay + jitter);
+    }
+
+    async startWs({ isReconnect = false } = {}) {
+        this.clearWsReconnectTimer();
+        if (isReconnect) {
+            this._wsIgnoreClose = true;
+            try {
+                this.state.ws.socket?.close();
+            } catch {}
+            this.state.ws.socket = null;
+            this._wsIgnoreClose = false;
+        }
+
+        const token = this._relayWsToken || (await this.fetchRelayToken());
         const base = this.getRelayWsUrl().trim().replace(/\/$/, '');
-        const wsUrl = `${base}/meetings/${this.meetingId}/live?token=${encodeURIComponent(token)}&format=pcm16&transcript=1`;
+        const wsUrl = `${base}/meetings/${this.meetingId}/live?format=pcm16&transcript=1&auth=post`;
         const ws = new WebSocket(wsUrl);
         this.state.ws.socket = ws;
         this.state.ws.connectedAt = null;
@@ -1165,10 +1261,18 @@ export class MeetingLiveSession {
         this.emit('wsStatus', { text: '' });
 
         ws.onopen = () => {
+            try {
+                ws.send(JSON.stringify({ type: 'auth', token }));
+            } catch (e) {
+                this.logEvent(`WS auth send failed: ${e?.message ?? e}`);
+            }
+            this._wsReconnectAttempts = 0;
+            this._upstreamSttConnected = true;
             this.state.ws.connected = true;
             this.state.ws.connectedAt = Date.now();
-            this.logEvent('WS connected ✓');
+            this.logEvent(isReconnect ? 'WS reconnected ✓' : 'WS connected ✓');
             this._emitTransport('ws', 'Live WebSocket connected');
+            this.stopWsAuxiliaryTransports();
             this.emit('wsStatus', { text: '' });
             if (this.state.audio.keepaliveTimer) clearInterval(this.state.audio.keepaliveTimer);
             this.state.audio.lastSentAt = Date.now();
@@ -1203,12 +1307,10 @@ export class MeetingLiveSession {
                 return;
             }
             if (!this._wsFallbackAttempted) {
-                this.emit('wsStatus', { text: 'Switching to HTTP captions…' });
-                this.switchToHttpAfterWsFailure();
+                this.scheduleWsReconnect(`code=${code}`);
                 return;
             }
             this.emit('wsStatus', { text: '' });
-            this.startTranscriptPolling();
         };
         ws.onmessage = (ev) => {
             try {
@@ -1219,6 +1321,25 @@ export class MeetingLiveSession {
                     if (msg.error === 'deepgram_key_missing' || msg.error === 'pulse_key_missing') {
                         this.emit('wsStatus', { text: 'WS: STT API key missing (.env)' });
                     }
+                    if (msg.error === 'relay_at_capacity') {
+                        this.scheduleWsReconnect('capacity');
+                    }
+                    return;
+                }
+                if (msg?.event === 'upstream_stt.disconnected') {
+                    this._upstreamSttConnected = false;
+                    this.logEvent('STT upstream disconnected — reconnecting…');
+                    this.emit('wsStatus', { text: 'STT reconnecting…' });
+                    return;
+                }
+                if (msg?.event === 'auth.ok') {
+                    return;
+                }
+                if (msg?.event === 'upstream_stt.reconnected') {
+                    this._upstreamSttConnected = true;
+                    this.logEvent('STT upstream reconnected ✓');
+                    this.emit('wsStatus', { text: '' });
+                    this._flushPcmReconnectBuffer(this.state.ws.socket);
                     return;
                 }
                 if (msg?.event === 'stats.updated') this.scheduleWsStatsFrame(msg.data);
@@ -1228,12 +1349,28 @@ export class MeetingLiveSession {
             } catch {}
         };
 
-        this.startWsPcm(ws).catch((e) => {
-            this.logEvent(`Mic PCM error: ${e?.message ?? e} — falling back to HTTP chunks`);
-            if (this.state.meeting.running && !this._wsFallbackAttempted) {
-                this.switchToHttpAfterWsFailure();
-            }
-        });
+        if (!isReconnect) {
+            await this.startWsPcm(ws).catch((e) => {
+                this.logEvent(`Mic PCM error: ${e?.message ?? e} — falling back to HTTP chunks`);
+                if (this.state.meeting.running && !this._wsFallbackAttempted) {
+                    this.switchToHttpAfterWsFailure();
+                }
+            });
+        }
+    }
+
+    _flushPcmReconnectBuffer(ws) {
+        if (!ws || ws.readyState !== WebSocket.OPEN || !this._pcmReconnectQueue?.length) return;
+        const q = this._pcmReconnectQueue.splice(0);
+        for (const buf of q) {
+            try {
+                ws.send(buf);
+                this.state.audio.lastSentAt = Date.now();
+            } catch {}
+        }
+        if (q.length > 0) {
+            this.logEvent(`Flushed ${q.length} buffered PCM frames after STT reconnect`);
+        }
     }
 
     async startWsPcm(ws) {
@@ -1284,7 +1421,8 @@ export class MeetingLiveSession {
 
         node.port.onmessage = (ev) => {
             if (!this.state.meeting.running) return;
-            if (ws.readyState !== WebSocket.OPEN) return;
+            const activeWs = this.state.ws.socket;
+            if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
             const chunk = ev.data;
             if (!(chunk instanceof Float32Array) || chunk.length === 0) return;
             const frameSamples = 640;
@@ -1297,8 +1435,18 @@ export class MeetingLiveSession {
             while (offset + frameSamples <= src.length) {
                 const frame = src.subarray(offset, offset + frameSamples);
                 const toSend = this.state.meeting.paused ? new Float32Array(frameSamples) : frame;
+                const pcmBuf = floatToPcm16LE(toSend);
+                if (!this._upstreamSttConnected) {
+                    if (!this._pcmReconnectQueue) this._pcmReconnectQueue = [];
+                    this._pcmReconnectQueue.push(pcmBuf);
+                    if (this._pcmReconnectQueue.length > this._pcmReconnectMaxFrames) {
+                        this._pcmReconnectQueue.shift();
+                    }
+                    offset += frameSamples;
+                    continue;
+                }
                 try {
-                    ws.send(floatToPcm16LE(toSend));
+                    activeWs.send(pcmBuf);
                     this.state.audio.lastSentAt = Date.now();
                 } catch {}
                 offset += frameSamples;
@@ -1520,7 +1668,10 @@ export class MeetingLiveSession {
         this.state.ws.connected = false;
         this.state.ws.connectedAt = null;
         this.state.ws.useServerAudioClock = false;
+        this.clearWsReconnectTimer();
         this._wsFallbackAttempted = false;
+        this._wsReconnectAttempts = 0;
+        this._relayWsToken = null;
         this.state.meeting.recorder = null;
         this.state.meeting.stream = null;
         this.state.meeting.audioCtx = null;

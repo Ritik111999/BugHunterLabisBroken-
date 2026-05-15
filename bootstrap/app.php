@@ -18,6 +18,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'api.auth' => ApiAuthenticate::class,
             'admin' => AdminMiddleware::class,
             'wechirp.native-vite' => WechirpNativeWebViewVite::class,
+            'relay.internal' => \App\Http\Middleware\RelayInternalSecret::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

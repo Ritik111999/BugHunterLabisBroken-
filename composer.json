@@ -51,6 +51,10 @@
             "Composer\\Config::disableProcessTimeout",
             "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74,#86efac\" \"php artisan serve --host=127.0.0.1 --port=9000\" \"php artisan queue:listen --tries=1 --timeout=0 --queue=audio,default\" \"php artisan pail --timeout=0\" \"npm run dev\" \"php artisan deepgram:relay\" --names=server,queue,logs,vite,relay"
         ],
+        "dev:node": [
+            "Composer\\Config::disableProcessTimeout",
+            "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74,#a3e635\" \"php artisan serve --host=127.0.0.1 --port=9000\" \"php artisan queue:listen --tries=1 --timeout=0 --queue=audio,default\" \"php artisan pail --timeout=0\" \"npm run dev\" \"npm run relay:gateway\" --names=server,queue,logs,vite,gateway"
+        ],
         "dev:ios": [
             "bash scripts/dev-ios-simulator.sh"
         ],

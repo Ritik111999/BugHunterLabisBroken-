@@ -26,9 +26,16 @@ SERVE_PID=""
 QUEUE_PID=""
 RELAY_PID=""
 RELAY_PORT="9001"
+RELAY_ENGINE="php-amphp"
 if [[ -f "${ROOT}/.env" ]]; then
   _rp="$(grep -E '^WC_RELAY_PORT=' "${ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' ')"
   [[ -n "${_rp}" ]] && RELAY_PORT="${_rp}"
+  _re="$(grep -E '^WECHIRP_RELAY_ENGINE=' "${ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' ')"
+  [[ -n "${_re}" ]] && RELAY_ENGINE="${_re}"
+  if [[ "${RELAY_ENGINE}" == "node" ]]; then
+    _gp="$(grep -E '^WC_RELAY_GATEWAY_PORT=' "${ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' ')"
+    [[ -n "${_gp}" ]] && RELAY_PORT="${_gp}"
+  fi
 fi
 
 cleanup() {
@@ -87,14 +94,20 @@ fi
 
 # Live meeting STT uses a separate WebSocket relay (not Laravel HTTP). Without it, the app shows WS code 1006.
 if curl -sf --max-time 2 "http://127.0.0.1:${RELAY_PORT}/up" >/dev/null 2>&1; then
-  echo "==> Deepgram relay already reachable at ws://127.0.0.1:${RELAY_PORT}"
+  echo "==> Live relay already reachable at ws://127.0.0.1:${RELAY_PORT} (${RELAY_ENGINE})"
 else
   if lsof -nP -iTCP:"${RELAY_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
     free_port_if_stale "${RELAY_PORT}"
   fi
-  echo "==> Starting Deepgram relay for live transcription on ws://127.0.0.1:${RELAY_PORT} …"
-  php artisan deepgram:relay --host=127.0.0.1 --port="${RELAY_PORT}" &
-  RELAY_PID=$!
+  if [[ "${RELAY_ENGINE}" == "node" ]]; then
+    echo "==> Starting Node Deepgram gateway on ws://127.0.0.1:${RELAY_PORT} …"
+    npm run relay:gateway &
+    RELAY_PID=$!
+  else
+    echo "==> Starting PHP Deepgram relay on ws://127.0.0.1:${RELAY_PORT} …"
+    php artisan deepgram:relay --host=127.0.0.1 --port="${RELAY_PORT}" &
+    RELAY_PID=$!
+  fi
   for _ in $(seq 1 60); do
     if curl -sf --max-time 2 "http://127.0.0.1:${RELAY_PORT}/up" >/dev/null 2>&1; then
       break

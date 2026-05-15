@@ -59,7 +59,7 @@ AWS_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com
 AWS_USE_PATH_STYLE_ENDPOINT=true
 ```
 
-## 5. Relay TLS
+## 5. Relay TLS + WebSocket proxy
 
 Expose the relay behind nginx/Caddy:
 
@@ -67,7 +67,23 @@ Expose the relay behind nginx/Caddy:
 WC_RELAY_WS_URL=wss://api.yourdomain.com/ws-relay
 ```
 
-Proxy WebSocket upgrades to `127.0.0.1:9001`.
+Proxy WebSocket upgrades to `127.0.0.1:9001`. Full example: [`nginx-wechirp-relay.conf.example`](nginx-wechirp-relay.conf.example).
+
+Relay tuning (optional):
+
+```env
+MEETING_RELAY_TOKEN_TTL_SECONDS=900
+MEETING_RELAY_MAX_CONNECTIONS=100
+MEETING_WS_PERSIST_INTERVAL_SECONDS=8
+MEETING_RELAY_UPSTREAM_KEEPALIVE_SECONDS=4
+MEETING_RELAY_REDIS_HOT_STATE=true
+MEETING_RELAY_STICKY_SESSIONS=true
+```
+
+- **Metrics:** `GET http://127.0.0.1:9001/metrics` (Prometheus-style text)
+- **Live tokens:** clients should `POST /api/meetings/{id}/live-token` before opening the relay WebSocket
+- **Multiple relay workers:** use `npm run relay:cluster` or `bash scripts/run-relay-cluster.sh` (ports 9001,9011,9021 + proxy :9100). See [`relay-scaling.md`](relay-scaling.md).
+- **Post-connect auth:** clients use `auth=post` and send `{"type":"auth","token"}` as the first WS frame (tokens not in URLs).
 
 ## 6. Capacitor / mobile
 

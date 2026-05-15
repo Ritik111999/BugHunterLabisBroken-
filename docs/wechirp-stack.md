@@ -7,7 +7,7 @@ Official stack for the Otter-style meeting product. **Deepgram** is the only STT
 | Layer | Technology | Role |
 |--------|------------|------|
 | **Live STT** | [Deepgram](https://deepgram.com) Nova-3 (live), Nova-2 (batch) | Streaming transcript + diarization |
-| **Live ingest** | PHP Amp WebSocket relay (`php artisan deepgram:relay`) | Auth, forward audio, voiceprint matching |
+| **Live ingest** | PHP Amp WebSocket relay (`php artisan deepgram:relay`) | Short-lived tokens, Deepgram keepalive, reconnect, `/metrics` |
 | **Batch / chunks** | Laravel queues + `scripts/analyze_audio.py` | HTTP fallback, analytics, crosstalk |
 | **Speaker ID** | SpeechBrain ECAPA (`scripts/embed_audio.py`) | Enroll + match voiceprints |
 | **Post-meeting AI** | OpenAI `gpt-4o-mini` + `text-embedding-3-small` | Summary, topics, actions, semantic search |

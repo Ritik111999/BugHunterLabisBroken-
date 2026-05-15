@@ -50,8 +50,13 @@ return [
     |--------------------------------------------------------------------------
     */
     'relay' => [
-        'engine' => 'php-amphp',
+        // php-amphp | node — node: relay-gateway/server.mjs + /api/internal/relay/*
+        'engine' => env('WECHIRP_RELAY_ENGINE', 'php-amphp'),
         'artisan_command' => 'deepgram:relay',
+        'node_command' => 'node relay-gateway/server.mjs',
+        'cluster_proxy' => 'relay-gateway/cluster-proxy.mjs',
+        'cluster_script' => 'scripts/run-relay-cluster.sh',
+        'auth_mode' => 'post',
     ],
 
     /*

@@ -9,6 +9,7 @@
         $sttProvider = strtolower((string) env('MEETING_STT_PROVIDER', 'deepgram'));
         $wechirpBoot = [
             'relayWsUrl' => (string) config('services.wechirp.relay_ws_url'),
+            'relayEngine' => (string) config('services.wechirp.relay_engine', 'php-amphp'),
             'sttProvider' => $sttProvider,
             'sttConfigured' => $sttProvider === 'pulse'
                 ? trim((string) (config('services.pulse.api_key') ?: env('PULSE_API_KEY', ''))) !== ''

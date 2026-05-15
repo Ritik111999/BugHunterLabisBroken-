@@ -772,7 +772,7 @@ function startWs() {
     const token  = state.token;
     const base   = $('relayWsUrl').value.trim().replace(/\/$/, '');
     // Chrome test mode: stream raw PCM16 (16kHz mono) to avoid WebM/Opus chunk issues.
-    const wsUrl  = `${base}/meetings/${state.meetingId}/live?token=${encodeURIComponent(token)}&format=pcm16&transcript=0`;
+    const wsUrl  = `${base}/meetings/${state.meetingId}/live?format=pcm16&transcript=0&auth=post`;
     const ws     = new WebSocket(wsUrl);
     state.ws.socket = ws;
 
@@ -780,6 +780,7 @@ function startWs() {
     $('wsStatusBadge').textContent = 'WS: connecting…';
 
     ws.onopen = () => {
+        try { ws.send(JSON.stringify({ type: 'auth', token })); } catch {}
         state.ws.connected = true;
         logEvent('WS connected ✓');
         $('wsStatusBadge').textContent = 'WS: connected ✓';

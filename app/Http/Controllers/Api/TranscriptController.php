@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Meeting;
 use App\Models\MeetingTranscriptSegment;
 use App\Models\Transcript;
+use App\Support\MeetingRelayLiveCache;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
 use Laravel\Sanctum\PersonalAccessToken;
@@ -19,6 +20,16 @@ class TranscriptController extends Controller
             ->whereKey($id)
             ->where('host_id', auth()->id())
             ->firstOrFail();
+
+        $cached = MeetingRelayLiveCache::getTranscriptLines((int) $meeting->id);
+        if (is_array($cached) && ! empty($cached['lines'])) {
+            return response()->json([
+                'meeting_id' => (int) $meeting->id,
+                'source' => 'relay_cache',
+                'items' => [],
+                'lines' => $cached['lines'],
+            ]);
+        }
 
         $segments = $this->fetchSegments($meeting->id);
         if ($segments !== []) {
@@ -77,6 +88,28 @@ class TranscriptController extends Controller
             $startedAt = time();
 
             while ((time() - $startedAt) < 600) {
+                $cached = MeetingRelayLiveCache::getTranscriptLines((int) $meeting->id);
+                if (is_array($cached) && ! empty($cached['lines'])) {
+                    $payload = [
+                        'meeting_id' => (int) $meeting->id,
+                        'lines' => $cached['lines'],
+                        'source' => 'relay_cache',
+                    ];
+                    $fingerprint = sha1(json_encode($payload));
+                    if ($fingerprint !== $lastFingerprint) {
+                        $lastFingerprint = $fingerprint;
+                        echo "event: transcript.updated\n";
+                        echo 'data: '.json_encode($payload)."\n\n";
+                        flush();
+                    } else {
+                        echo ": keepalive\n\n";
+                        flush();
+                    }
+                    usleep(300_000);
+
+                    continue;
+                }
+
                 $segments = $this->fetchSegments($meeting->id, 40);
                 if ($segments !== []) {
                     $lines = $this->segmentsToLiveLines($segments);

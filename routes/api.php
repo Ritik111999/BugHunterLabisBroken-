@@ -33,6 +33,17 @@ use Illuminate\Support\Facades\Route;
 Route::post('/signup', [AuthController::class, 'signup']);
 Route::post('/login', [AuthController::class, 'login']);
 
+/*
+|--------------------------------------------------------------------------
+| Node relay gateway (internal — X-Relay-Secret)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('internal/relay')->middleware('relay.internal')->group(function () {
+    Route::post('/validate-auth', [\App\Http\Controllers\Api\Internal\RelayGatewayController::class, 'validateAuth']);
+    Route::post('/persist', [\App\Http\Controllers\Api\Internal\RelayGatewayController::class, 'persist']);
+    Route::post('/voice-chunk', [\App\Http\Controllers\Api\Internal\RelayGatewayController::class, 'ingestVoiceChunk']);
+});
+
 // Forgot Password
 Route::post('/send-otp', [ForgotPasswordController::class, 'sendOtp']);
 Route::post('/verify-otp', [ForgotPasswordController::class, 'verifyOtp']);
@@ -94,6 +105,9 @@ Route::middleware(['api.auth', 'throttle:api-authenticated'])->group(function ()
 
     // Start meeting
     Route::post('/meetings/{id}/start', [MeetingController::class, 'start']);
+
+    // Short-lived WebSocket relay token (preferred over Sanctum PAT in WS URL)
+    Route::post('/meetings/{id}/live-token', [\App\Http\Controllers\Api\MeetingLiveTokenController::class, 'store']);
 
     // End meeting
     Route::post('/meetings/{id}/end', [MeetingController::class, 'end']);

@@ -23,7 +23,11 @@ use App\Models\MeetingAnalytic;
 use App\Models\MeetingParticipant;
 use App\Models\ParticipantStat;
 use App\Models\SpeakerMapping;
+use App\Models\User;
 use App\Support\MeetingLiveTuning;
+use App\Support\MeetingRelayLiveCache;
+use App\Support\MeetingRelayMetrics;
+use App\Support\MeetingRelayTokenService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -41,6 +45,7 @@ class DeepgramLiveRelay
 {
     public function run(string $host = '127.0.0.1', int $port = 9001): void
     {
+        MeetingRelayMetrics::boot();
         $sockets = [new InternetAddress($host, $port)];
         $logger = new NullLogger;
         $server = SocketHttpServer::createForDirectAccess($logger);
@@ -64,6 +69,16 @@ class DeepgramLiveRelay
 
                     $meetingId = (int) $m[1];
 
+                    if (! MeetingRelayMetrics::tryAcquireConnection()) {
+                        $client->sendText(json_encode([
+                            'error' => 'relay_at_capacity',
+                            'hint' => 'Too many live meetings on this relay. Retry shortly or use HTTP chunks.',
+                        ]));
+                        $client->close();
+
+                        return;
+                    }
+
                     $token = '';
                     parse_str((string) $request->getUri()->getQuery(), $qs);
                     if (is_array($qs) && isset($qs['token'])) {
@@ -85,7 +100,22 @@ class DeepgramLiveRelay
                         $parsed = filter_var($qs['transcript'], FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
                         $transcriptEnabled = $parsed === null ? true : (bool) $parsed;
                     }
-                    (new DeepgramLiveRelayConnection)->handle($client, $meetingId, $token, $format, $transcriptEnabled);
+                    $authMode = 'query';
+                    if (is_array($qs) && isset($qs['auth'])) {
+                        $authMode = strtolower(trim((string) $qs['auth']));
+                    }
+                    try {
+                        (new DeepgramLiveRelayConnection)->handle(
+                            $client,
+                            $meetingId,
+                            $token,
+                            $format,
+                            $transcriptEnabled,
+                            $authMode,
+                        );
+                    } finally {
+                        MeetingRelayMetrics::releaseConnection();
+                    }
                 } catch (Throwable $e) {
                     $client->sendText(json_encode(['error' => 'internal_error', 'message' => $e->getMessage()]));
                     $client->close();
@@ -109,6 +139,13 @@ class DeepgramLiveRelay
                 $path = $request->getUri()->getPath();
                 if ($path === '/up') {
                     return new Response(status: 200, body: 'ok');
+                }
+                if ($path === '/metrics') {
+                    return new Response(
+                        status: 200,
+                        headers: ['content-type' => 'text/plain; version=0.0.4'],
+                        body: MeetingRelayMetrics::prometheusBody(),
+                    );
                 }
                 if (preg_match('#^/meetings/\\d+/live$#', $path)) {
                     return $this->websocket->handleRequest($request);
@@ -146,6 +183,10 @@ class DeepgramLiveRelayConnection
     private ?string $persistTimerId = null;
 
     private ?string $voiceEmbedTimerId = null;
+
+    private ?string $upstreamKeepaliveTimerId = null;
+
+    private float $lastUpstreamBinaryAt = 0.0;
 
     private bool $transcriptEnabled = true;
 
@@ -382,6 +423,10 @@ class DeepgramLiveRelayConnection
             return;
         }
         $this->lastTranscriptFingerprint = $fingerprint;
+        try {
+            MeetingRelayLiveCache::putTranscriptLines($meetingId, $lines);
+        } catch (Throwable) {
+        }
         try {
             \App\Support\LiveTranscriptWriter::persistRelayLines(
                 $meetingId,
@@ -2320,7 +2365,8 @@ class DeepgramLiveRelayConnection
         int $meetingId,
         string $sanctumToken,
         string $format = 'webm',
-        bool $transcriptEnabled = true
+        bool $transcriptEnabled = true,
+        string $authMode = 'query',
     ): void {
         if ($meetingId <= 0) {
             $frontend->close();
@@ -2328,7 +2374,12 @@ class DeepgramLiveRelayConnection
             return;
         }
 
-        $user = $this->authenticate($sanctumToken);
+        $user = null;
+        if ($authMode === 'post' && trim($sanctumToken) === '') {
+            $user = $this->authenticateViaPostMessage($frontend, $meetingId);
+        } else {
+            $user = $this->authenticate($sanctumToken, $meetingId);
+        }
         if (! $user) {
             $frontend->sendText(json_encode(['error' => 'unauthenticated']));
             $frontend->close();
@@ -2441,6 +2492,7 @@ class DeepgramLiveRelayConnection
         $upstream = $sttProvider === 'pulse'
             ? $this->connectPulse($pulseKey)
             : $this->connectDeepgram($deepgramKey);
+        $this->lastUpstreamBinaryAt = microtime(true);
 
         // Coalesce frontend updates on timers (prevents 1006 from browser overload).
         // User-facing "bar update" cadence is controlled here (default 100ms ≈ realtime feel).
@@ -2456,6 +2508,7 @@ class DeepgramLiveRelayConnection
                     $frontend->sendText(json_encode(['event' => 'stats.updated', 'data' => $snapshot]));
                 }
             } catch (Throwable $e) {
+                MeetingRelayMetrics::recordFrontendSendFailure();
                 Log::warning('relay_frontend_send_failed', [
                     'meeting_id' => $meetingId,
                     'event' => 'stats.updated',
@@ -2479,6 +2532,7 @@ class DeepgramLiveRelayConnection
                 try {
                     $this->pushTranscriptUpdate($frontend, $meetingId);
                 } catch (Throwable $e) {
+                    MeetingRelayMetrics::recordFrontendSendFailure();
                     Log::warning('relay_frontend_send_failed', [
                         'meeting_id' => $meetingId,
                         'event' => 'transcript.updated',
@@ -2520,12 +2574,34 @@ class DeepgramLiveRelayConnection
         });
 
         // Persist less frequently and outside the receive loop to avoid backpressure.
-        $this->persistTimerId = EventLoop::repeat(2.0, function () use ($meetingId) {
+        $persistInterval = MeetingLiveTuning::float('relay.persist_interval_seconds', 8.0);
+        $persistInterval = max(2.0, min(30.0, $persistInterval));
+        $this->persistTimerId = EventLoop::repeat($persistInterval, function () use ($meetingId) {
             try {
                 $this->persistToDb($meetingId);
             } catch (Throwable) {
             }
         });
+
+        // Deepgram closes idle upstream sockets after ~10s without audio; send KeepAlive text frames.
+        if ($sttProvider !== 'pulse') {
+            $keepaliveSec = MeetingLiveTuning::float('relay.upstream_keepalive_seconds', 4.0);
+            $keepaliveSec = max(2.0, min(8.0, $keepaliveSec));
+            $this->upstreamKeepaliveTimerId = EventLoop::repeat($keepaliveSec, function () use (&$upstream, $sttProvider) {
+                if ($sttProvider === 'pulse') {
+                    return;
+                }
+                $since = microtime(true) - $this->lastUpstreamBinaryAt;
+                if ($since < $keepaliveSec) {
+                    return;
+                }
+                try {
+                    $upstream->sendText('{"type":"KeepAlive"}');
+                    MeetingRelayMetrics::recordUpstreamKeepalive();
+                } catch (Throwable) {
+                }
+            });
+        }
 
         // IMPORTANT: Do NOT auto-close the frontend WS from the relay.
         // The connection should remain open indefinitely and only close when:
@@ -2596,6 +2672,7 @@ class DeepgramLiveRelayConnection
                         ? $this->connectPulse($pulseKey)
                         : $this->connectDeepgram($deepgramKey);
                     $backoffMs = 500;
+                    MeetingRelayMetrics::recordUpstreamReconnect();
                     try {
                         if (! $frontend->isClosed()) {
                             $frontend->sendText(json_encode([
@@ -2633,12 +2710,24 @@ class DeepgramLiveRelayConnection
             }
         });
 
+        $maxFrameBytes = max(4096, (int) config('meeting_voice.relay.max_binary_frame_bytes', 65536));
+
         try {
             while ($message = $frontend->receive()) {
                 if ($message->isBinary()) {
                     $bytes = $message->buffer();
+                    if (strlen($bytes) > $maxFrameBytes) {
+                        Log::warning('relay_frame_too_large', [
+                            'meeting_id' => $meetingId,
+                            'bytes' => strlen($bytes),
+                            'max' => $maxFrameBytes,
+                        ]);
+
+                        continue;
+                    }
                     try {
                         $upstream->sendBinary($bytes);
+                        $this->lastUpstreamBinaryAt = microtime(true);
                     } catch (Throwable $e) {
                         Log::warning('upstream_stt_send_failed', [
                             'meeting_id' => $meetingId,
@@ -2697,6 +2786,12 @@ class DeepgramLiveRelayConnection
             } catch (Throwable) {
             }
             try {
+                if ($this->upstreamKeepaliveTimerId) {
+                    EventLoop::cancel($this->upstreamKeepaliveTimerId);
+                }
+            } catch (Throwable) {
+            }
+            try {
                 $upstream->close();
             } catch (Throwable) {
             }
@@ -2705,14 +2800,72 @@ class DeepgramLiveRelayConnection
                 $this->persistToDb($meetingId);
             } catch (Throwable) {
             }
+            try {
+                MeetingRelayLiveCache::forget($meetingId);
+            } catch (Throwable) {
+            }
         }
     }
 
-    private function authenticate(string $token): ?object
+    private function authenticate(string $token, int $expectedMeetingId): ?object
     {
+        $token = trim($token);
+        if ($token === '') {
+            return null;
+        }
+
+        $relay = MeetingRelayTokenService::resolve($token);
+        if ($relay !== null && (int) $relay['meeting_id'] === $expectedMeetingId) {
+            return User::query()->whereKey((int) $relay['user_id'])->first();
+        }
+
         $pat = PersonalAccessToken::findToken($token);
 
         return $pat?->tokenable;
+    }
+
+    /**
+     * First JSON text frame must be {"type":"auth","token":"..."} (keeps tokens out of access logs).
+     */
+    private function authenticateViaPostMessage(WebsocketClient $frontend, int $expectedMeetingId): ?object
+    {
+        $timeoutSeconds = max(2.0, min(15.0, MeetingLiveTuning::float('relay.post_auth_timeout_seconds', 5.0)));
+        $deadline = microtime(true) + $timeoutSeconds;
+
+        while (microtime(true) < $deadline) {
+            if ($frontend->isClosed()) {
+                return null;
+            }
+            try {
+                $message = $frontend->receive();
+            } catch (Throwable) {
+                return null;
+            }
+            if ($message->isBinary()) {
+                continue;
+            }
+            $raw = $this->readClientMessage($message);
+            if ($raw === null) {
+                continue;
+            }
+            $data = json_decode($raw, true);
+            if (! is_array($data) || strtolower((string) ($data['type'] ?? '')) !== 'auth') {
+                continue;
+            }
+            $user = $this->authenticate((string) ($data['token'] ?? ''), $expectedMeetingId);
+            if ($user) {
+                try {
+                    $frontend->sendText(json_encode(['event' => 'auth.ok']));
+                } catch (Throwable) {
+                }
+
+                return $user;
+            }
+
+            return null;
+        }
+
+        return null;
     }
 
     private function connectDeepgram(string $apiKey): ClientWebsocketConnection
@@ -3603,6 +3756,14 @@ class DeepgramLiveRelayConnection
             );
 
         });
+
+        try {
+            $snapshot = $this->buildSnapshot($meetingId);
+            if ($snapshot) {
+                MeetingRelayLiveCache::putSnapshot($meetingId, $snapshot);
+            }
+        } catch (Throwable) {
+        }
     }
 
     /**

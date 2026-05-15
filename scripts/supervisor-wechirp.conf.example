@@ -29,3 +29,5 @@ autostart=true
 autorestart=true
 redirect_stderr=true
 stdout_logfile=/var/log/wechirp/relay.log
+; Scale: run additional relays on 9011, 9021… behind nginx ip_hash (see docs/nginx-wechirp-relay.conf.example).
+; Health: curl -s http://127.0.0.1:9001/up && curl -s http://127.0.0.1:9001/metrics
