@@ -164,8 +164,7 @@ What it is for
 How to run the relay (on your machine or server)
   From the Laravel project folder:
     php artisan deepgram:relay
-  Default in code is host 127.0.0.1 and port 8082 (you can change it):
-    php artisan deepgram:relay --host=127.0.0.1 --port=8082
+  Default in `php artisan deepgram:relay` is host `127.0.0.1` and port `8081` (override with `--port=`).
 
 How to connect (URL pattern)
   ws://HOST:PORT/meetings/{meetingId}/live?token=YOUR_LOGIN_TOKEN

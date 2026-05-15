@@ -3,8 +3,9 @@
 
 <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>{{ $title }} | {{ config('app.name', 'WeChirp') }}</title>
+    @include('partials.pwa-head')
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 </head>
 
@@ -16,6 +17,7 @@
             {!! $content !!}
         </div>
     </div>
+    @include('partials.pwa-register')
 </body>
 
 </html>

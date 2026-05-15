@@ -2,57 +2,63 @@
 
 namespace App\Services;
 
+use Amp\Future;
 use Amp\Http\Server\DefaultErrorHandler;
 use Amp\Http\Server\Request;
+use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Http\Server\SocketHttpServer;
+use Amp\Process\Process;
 use Amp\Socket\InternetAddress;
 use Amp\Websocket\Client\WebsocketConnection as ClientWebsocketConnection;
 use Amp\Websocket\Client\WebsocketHandshake;
-use Amp\Websocket\WebsocketMessage;
-use function Amp\Websocket\Client\connect;
 use Amp\Websocket\Server\Rfc6455Acceptor;
 use Amp\Websocket\Server\Websocket;
 use Amp\Websocket\Server\WebsocketClientHandler;
 use Amp\Websocket\WebsocketClient;
+use Amp\Websocket\WebsocketCloseCode;
+use Amp\Websocket\WebsocketMessage;
 use App\Models\Meeting;
 use App\Models\MeetingAnalytic;
 use App\Models\MeetingParticipant;
 use App\Models\ParticipantStat;
 use App\Models\SpeakerMapping;
+use App\Support\MeetingLiveTuning;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Laravel\Sanctum\PersonalAccessToken;
 use Psr\Log\NullLogger;
-use Amp\Process\Process;
-use Amp\Websocket\WebsocketCloseCode;
 use Revolt\EventLoop;
 use Throwable;
+
 use function Amp\async;
 use function Amp\ByteStream\buffer;
 use function Amp\trapSignal;
+use function Amp\Websocket\Client\connect;
 
 class DeepgramLiveRelay
 {
-    public function run(string $host = '127.0.0.1', int $port = 8081): void
+    public function run(string $host = '127.0.0.1', int $port = 9001): void
     {
         $sockets = [new InternetAddress($host, $port)];
-        $logger = new NullLogger();
+        $logger = new NullLogger;
         $server = SocketHttpServer::createForDirectAccess($logger);
         $server->expose(...$sockets);
 
-        $errorHandler = new DefaultErrorHandler();
-        $acceptor = new Rfc6455Acceptor();
+        $errorHandler = new DefaultErrorHandler;
+        $acceptor = new Rfc6455Acceptor;
 
-        $clientHandler = new class implements WebsocketClientHandler {
+        $clientHandler = new class implements WebsocketClientHandler
+        {
             public function handleClient(WebsocketClient $client, Request $request, Response $response): void
             {
                 try {
                     $path = $request->getUri()->getPath();
-                    if (!preg_match('#^/meetings/(\\d+)/live$#', $path, $m)) {
+                    if (! preg_match('#^/meetings/(\\d+)/live$#', $path, $m)) {
                         $client->sendText(json_encode(['error' => 'not_found']));
                         $client->close();
+
                         return;
                     }
 
@@ -94,10 +100,9 @@ class DeepgramLiveRelay
             clientHandler: $clientHandler,
         );
 
-        $handler = new class($websocket) implements \Amp\Http\Server\RequestHandler {
-            public function __construct(private readonly Websocket $websocket)
-            {
-            }
+        $handler = new class($websocket) implements RequestHandler
+        {
+            public function __construct(private readonly Websocket $websocket) {}
 
             public function handleRequest(Request $request): Response
             {
@@ -108,6 +113,7 @@ class DeepgramLiveRelay
                 if (preg_match('#^/meetings/\\d+/live$#', $path)) {
                     return $this->websocket->handleRequest($request);
                 }
+
                 return new Response(status: 404, body: 'not found');
             }
         };
@@ -122,15 +128,25 @@ class DeepgramLiveRelayConnection
 {
     /** @var array<string,float> */
     private array $speakerSeconds = [];
+
     private float $totalSeconds = 0.0;
+
     private float $overlapSeconds = 0.0;
+
     private float $lastFrontendStatsAt = 0.0;
+
     private float $lastFrontendTranscriptAt = 0.0;
+
     private ?string $statsTimerId = null;
+
     private ?string $transcriptTimerId = null;
+
     private ?string $maintenanceTimerId = null;
+
     private ?string $persistTimerId = null;
+
     private ?string $voiceEmbedTimerId = null;
+
     private bool $transcriptEnabled = true;
 
     /**
@@ -140,17 +156,18 @@ class DeepgramLiveRelayConnection
      * @var array<string,array{name:string,count:int}>
      */
     private array $speakerDetectedName = [];
+
     private bool $allowIntroEnrollment = false;
+
     private bool $voiceDebug = false;
 
     /**
      * Participants enrolled via HTTP intro before meeting started.
      * Keyed by lowercase name for fast lookup.
      *
-     * @var array<string,int>  name_lower => participant_id
+     * @var array<string,int> name_lower => participant_id
      */
     private array $enrolledParticipants = [];
-
 
     /** @var array<string,string> */
     private array $cumulativeSpeakerText = [];
@@ -177,14 +194,21 @@ class DeepgramLiveRelayConnection
     private array $audioChunks = [];
 
     private float $audioCursorSeconds = 0.0;
+
     private int $audioChunkIndex = 0;
+
     private int $embedEveryN = 5;
+
     private int $bootstrapChunks = 8;
 
     private ?string $streamWebmPath = null;
+
     private string $audioFormat = 'webm'; // 'webm' | 'pcm16'
+
     private int $pcmSampleRate = 16000;
+
     private float $maxAudioKeepSeconds = 35.0;
+
     private int $maxTranscriptCharsPerLabel = 6000;
 
     /**
@@ -194,12 +218,16 @@ class DeepgramLiveRelayConnection
      * @var array<string,list<array<int,float>>>
      */
     private array $speakerVoiceprintHistory = [];
+
     /** @var array<string,float> */
     private array $labelLastEmbedAt = [];
 
     private float $labelWindowSeconds = 8.0;
+
     private float $labelMinSpeechSeconds = 2.5;
+
     private float $labelEmbedCooldownSeconds = 4.0;
+
     private float $labelMinPurity = 0.65;
 
     /** @var array<int,array{participant_id:int,vector:array<int,float>}> */
@@ -220,17 +248,24 @@ class DeepgramLiveRelayConnection
      * @var array<int,float> participant_id => seconds
      */
     private array $fallbackParticipantSeconds = [];
+
     private float $fallbackLastAttributionCursor = 0.0;
+
     private float $fallbackLastEmbedAt = 0.0;
+
     /** @var array<int,float> participant_id => ema_posterior */
     private array $fallbackPosteriorEma = [];
+
     private int $fallbackStablePid = 0;
+
     private int $fallbackStableCount = 0;
 
     /** @var array<string,array<int,float>> label => [participant_id => ema_posterior] */
     private array $labelPosteriorEma = [];
+
     /** @var array<string,int> label => stable_participant_id */
     private array $labelStablePid = [];
+
     /** @var array<string,int> label => stable_count */
     private array $labelStableCount = [];
 
@@ -240,16 +275,21 @@ class DeepgramLiveRelayConnection
      * @var array<string,array{evidence_count:int,best_participant_id:int|null,best_participant_name:string,best_score:float,threshold:float,matched:bool}>
      */
     private array $lastVoiceMatching = [];
+
     /**
      * Last rolling fallback match info (collapsed diarization mode).
      *
      * @var array<string,mixed>
      */
     private array $lastFallbackMatching = [];
+
     /** @var array<int,array<string,mixed>> */
     private array $lastSttWords = [];
+
     private float $lastSttWordsUpdatedAt = 0.0;
+
     private float $lastEnrolledReloadAt = 0.0;
+
     /** @var array<int,float> participant_id => last_self_enroll_at */
     private array $selfEnrollLastAtByPid = [];
 
@@ -258,28 +298,44 @@ class DeepgramLiveRelayConnection
      * re-adding the full gap on every stats tick (which inflated talk time to 200%+).
      */
     private bool $talkClockBaselineReady = false;
+
     private float $lastTalkClockSpeechSum = 0.0;
+
     private float $lastTalkClockAudioCursor = 0.0;
+
     private float $lastImmediateTranscriptPushAt = 0.0;
+
     private float $lastImmediateStatsPushAt = 0.0;
+
     private float $lastSeenSegmentsPruneAt = 0.0;
+
     private bool $voiceEmbeddingBusy = false;
+
+    private bool $fastIdentifyBusy = false;
+
     private float $lastRealtimeAllocCursor = 0.0;
+
     private string $activeSpeakerLabel = '';
+
     private float $lastActiveSpeakerAt = 0.0;
+
     private string $lastTranscriptFingerprint = '';
+
     /** @var array<string,bool> */
     private array $autoBoundLabels = [];
+
     private float $lastSpeakerMapRefreshAt = 0.0;
+
     /** @var array<string,int> */
     private array $speakerLabelToParticipantIdCache = [];
+
     /** @var array<string,string> */
     private array $speakerLabelToNameCache = [];
 
     /**
      * Refresh speaker label -> participant/name caches.
      *
-     * @param array<int,string> $labels
+     * @param  array<int,string>  $labels
      */
     private function refreshSpeakerMappingCache(int $meetingId, array $labels, bool $force = false): void
     {
@@ -287,7 +343,7 @@ class DeepgramLiveRelayConnection
             return;
         }
         $now = microtime(true);
-        if (!$force && ($now - $this->lastSpeakerMapRefreshAt) < 1.0) {
+        if (! $force && ($now - $this->lastSpeakerMapRefreshAt) < 1.0) {
             return;
         }
         $rows = SpeakerMapping::query()
@@ -319,13 +375,22 @@ class DeepgramLiveRelayConnection
         }
         $fingerprintParts = [];
         foreach ($lines as $ln) {
-            $fingerprintParts[] = (string) ($ln['label'] ?? '') . '|' . (string) ($ln['text'] ?? '');
+            $fingerprintParts[] = (string) ($ln['label'] ?? '').'|'.(string) ($ln['text'] ?? '');
         }
         $fingerprint = sha1(implode("\n", $fingerprintParts));
         if ($fingerprint === $this->lastTranscriptFingerprint) {
             return;
         }
         $this->lastTranscriptFingerprint = $fingerprint;
+        try {
+            \App\Support\LiveTranscriptWriter::persistRelayLines(
+                $meetingId,
+                $lines,
+                (float) $this->audioCursorSeconds,
+            );
+        } catch (\Throwable) {
+            // Non-fatal: live WS UI still works if DB write fails.
+        }
         $frontend->sendText(json_encode([
             'event' => 'transcript.updated',
             'data' => [
@@ -357,7 +422,7 @@ class DeepgramLiveRelayConnection
             $label = (string) $label;
             $base = trim((string) ($this->cumulativeSpeakerText[$label] ?? ''));
             $partial = trim((string) ($this->livePartialByLabel[$label] ?? ''));
-            $text = trim($base === '' ? $partial : ($partial === '' ? $base : ($base . ' ' . $partial)));
+            $text = trim($base === '' ? $partial : ($partial === '' ? $base : ($base.' '.$partial)));
             if ($text === '') {
                 continue;
             }
@@ -369,7 +434,7 @@ class DeepgramLiveRelayConnection
 
             // Next: live voice matching decision (rolling ECAPA).
             $vm = $this->lastVoiceMatching[$label] ?? null;
-            if (!$name && is_array($vm) && (bool) ($vm['matched'] ?? false)) {
+            if (! $name && is_array($vm) && (bool) ($vm['matched'] ?? false)) {
                 $resolvedPid = is_numeric($vm['best_participant_id'] ?? null) ? (int) $vm['best_participant_id'] : null;
                 $confidence = is_numeric($vm['best_score'] ?? null) ? (float) $vm['best_score'] : null;
                 $name = (string) ($vm['best_participant_name'] ?? '');
@@ -377,19 +442,19 @@ class DeepgramLiveRelayConnection
 
             // If we attempted voice matching but it didn't pass threshold, do NOT force assignment.
             // In multi-participant meetings this should surface as unknown instead of a sticky wrong name.
-            if (!$name && is_array($vm) && array_key_exists('best_score', $vm) && count($this->enrolledVoiceprints) >= 2) {
+            if (! $name && is_array($vm) && array_key_exists('best_score', $vm) && count($this->enrolledVoiceprints) >= 2) {
                 $confidence = is_numeric($vm['best_score'] ?? null) ? (float) $vm['best_score'] : null;
                 $resolvedPid = null;
                 $name = 'Unknown Speaker';
             }
 
             // Fallback: SpeakerMapping cache (DB-driven). (Used mostly for single-speaker / placeholder flows.)
-            if (!$name) {
+            if (! $name) {
                 $name = (string) ($this->speakerLabelToNameCache[$label] ?? $label);
                 $resolvedPid = isset($this->speakerLabelToParticipantIdCache[$label]) ? (int) $this->speakerLabelToParticipantIdCache[$label] : null;
             }
 
-            if (!$name || trim($name) === '') {
+            if (! $name || trim($name) === '') {
                 $name = 'Unknown Speaker';
             }
 
@@ -401,6 +466,7 @@ class DeepgramLiveRelayConnection
                 'confidence' => $confidence,
             ];
         }
+
         return $lines;
     }
 
@@ -430,7 +496,7 @@ class DeepgramLiveRelayConnection
             }
             $name = $this->speakerDetectedName[$label]['name']
                 ?? (string) ($this->speakerLabelToNameCache[$label] ?? $label);
-            $parts[] = '[' . $name . '] ' . $t;
+            $parts[] = '['.$name.'] '.$t;
         }
 
         $full = trim(implode("\n", $parts));
@@ -458,26 +524,34 @@ class DeepgramLiveRelayConnection
         $words = array_filter(explode(' ', trim($t)), fn ($w) => $w !== '');
 
         $stop = array_flip([
-            'the','a','an','and','or','but','to','of','in','on','for','with','is','are','was','were','be','been',
-            'i','you','we','they','he','she','it','my','your','our','their','me','him','her','them',
-            'this','that','these','those','so','as','at','by','from','not','do','did','does','have','has','had',
-            'can','could','will','would','should','may','might','am','im','i\'m','name','say','says',
+            'the', 'a', 'an', 'and', 'or', 'but', 'to', 'of', 'in', 'on', 'for', 'with', 'is', 'are', 'was', 'were', 'be', 'been',
+            'i', 'you', 'we', 'they', 'he', 'she', 'it', 'my', 'your', 'our', 'their', 'me', 'him', 'her', 'them',
+            'this', 'that', 'these', 'those', 'so', 'as', 'at', 'by', 'from', 'not', 'do', 'did', 'does', 'have', 'has', 'had',
+            'can', 'could', 'will', 'would', 'should', 'may', 'might', 'am', 'im', 'i\'m', 'name', 'say', 'says',
         ]);
 
         $counts = [];
         foreach ($words as $w) {
-            if (isset($stop[$w])) continue;
-            if (strlen($w) < 3) continue;
+            if (isset($stop[$w])) {
+                continue;
+            }
+            if (strlen($w) < 3) {
+                continue;
+            }
             $counts[$w] = ($counts[$w] ?? 0) + 1;
         }
         arsort($counts);
+
         return array_slice(array_keys($counts), 0, 8);
     }
 
     private function buildSummary(string $text): string
     {
         $t = trim(preg_replace('/\\s+/', ' ', $text) ?? $text);
-        if ($t === '') return '';
+        if ($t === '') {
+            return '';
+        }
+
         return mb_substr($t, max(0, mb_strlen($t) - 500));
     }
 
@@ -487,13 +561,19 @@ class DeepgramLiveRelayConnection
     private function simpleSentiment(string $text): array
     {
         $t = strtolower($text);
-        $pos = ['good','great','nice','love','like','excellent','amazing','awesome','happy','thanks','thank'];
-        $neg = ['bad','hate','issue','problem','sad','angry','terrible','awful','worse','worst','fail','error'];
-        $p = 0; $n = 0;
-        foreach ($pos as $w) $p += substr_count($t, $w);
-        foreach ($neg as $w) $n += substr_count($t, $w);
+        $pos = ['good', 'great', 'nice', 'love', 'like', 'excellent', 'amazing', 'awesome', 'happy', 'thanks', 'thank'];
+        $neg = ['bad', 'hate', 'issue', 'problem', 'sad', 'angry', 'terrible', 'awful', 'worse', 'worst', 'fail', 'error'];
+        $p = 0;
+        $n = 0;
+        foreach ($pos as $w) {
+            $p += substr_count($t, $w);
+        }
+        foreach ($neg as $w) {
+            $n += substr_count($t, $w);
+        }
         $score = $p - $n;
         $label = $score > 0 ? 'positive' : ($score < 0 ? 'negative' : 'neutral');
+
         return ['label' => $label, 'score' => $score, 'positive_hits' => $p, 'negative_hits' => $n];
     }
 
@@ -532,7 +612,7 @@ class DeepgramLiveRelayConnection
         // Always reload when we have <2 voiceprints (can't do multi-speaker matching),
         // otherwise reload on a slower cadence.
         $needs = count($this->enrolledVoiceprints) < 2;
-        if (!$needs && $this->lastEnrolledReloadAt > 0.0 && ($now - $this->lastEnrolledReloadAt) < $every) {
+        if (! $needs && $this->lastEnrolledReloadAt > 0.0 && ($now - $this->lastEnrolledReloadAt) < $every) {
             return;
         }
         if ($needs && $this->lastEnrolledReloadAt > 0.0 && ($now - $this->lastEnrolledReloadAt) < 0.5) {
@@ -557,7 +637,7 @@ class DeepgramLiveRelayConnection
     private function maybeSelfEnrollFromDetectedNames(int $meetingId): void
     {
         // Keep this behavior gated to debug mode so we can safely iterate.
-        if (!$this->voiceDebug) {
+        if (! $this->voiceDebug) {
             return;
         }
         if (count($this->speakerDetectedName) === 0) {
@@ -606,7 +686,7 @@ class DeepgramLiveRelayConnection
             async(function () use ($meetingId, $pid, $name, $label, $rangeStart, $rangeEnd): void {
                 try {
                     $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
-                    if (!is_array($vec) || count($vec) < 32) {
+                    if (! is_array($vec) || count($vec) < 32) {
                         Log::info('relay_self_enroll_voiceprint_empty', [
                             'meeting_id' => $meetingId,
                             'participant_id' => $pid,
@@ -615,6 +695,7 @@ class DeepgramLiveRelayConnection
                             'range_start' => $rangeStart,
                             'range_end' => $rangeEnd,
                         ]);
+
                         return;
                     }
 
@@ -633,7 +714,7 @@ class DeepgramLiveRelayConnection
                         }
                         $ove = is_array($op->voice_embedding) ? $op->voice_embedding : [];
                         $ovp = $ove['voiceprint'] ?? null;
-                        if (!is_array($ovp) || count($ovp) < 32) {
+                        if (! is_array($ovp) || count($ovp) < 32) {
                             continue;
                         }
                         $sim = $this->cosineSimilarity($vec, array_map('floatval', $ovp));
@@ -648,13 +729,14 @@ class DeepgramLiveRelayConnection
                                 'conflicts_with_participant_id' => (int) $op->id,
                                 'conflicts_with_name' => (string) ($op->name ?? ''),
                             ]);
+
                             return;
                         }
                     }
 
                     DB::transaction(function () use ($pid, $vec): void {
                         $p = MeetingParticipant::query()->whereKey($pid)->lockForUpdate()->first();
-                        if (!$p) {
+                        if (! $p) {
                             return;
                         }
                         $prev = is_array($p->voice_embedding) ? $p->voice_embedding : [];
@@ -679,7 +761,7 @@ class DeepgramLiveRelayConnection
                             $voiceprints = array_slice($voiceprints, -1 * $max);
                         }
 
-                        if (!is_array($prev['voiceprint'] ?? null) || count((array) ($prev['voiceprint'] ?? [])) < 32) {
+                        if (! is_array($prev['voiceprint'] ?? null) || count((array) ($prev['voiceprint'] ?? [])) < 32) {
                             $prev['voiceprint'] = $voiceprints[count($voiceprints) - 1];
                         }
                         $prev['voiceprint_dim'] = is_array($prev['voiceprint'] ?? null) ? count((array) $prev['voiceprint']) : 0;
@@ -763,7 +845,7 @@ class DeepgramLiveRelayConnection
 
         $out = [];
         foreach ($byPid as $pid => $vectors) {
-            if (!is_array($vectors) || count($vectors) === 0) {
+            if (! is_array($vectors) || count($vectors) === 0) {
                 continue;
             }
             $n = count($vectors);
@@ -845,6 +927,7 @@ class DeepgramLiveRelayConnection
             }
             $n++;
         }
+
         return $n;
     }
 
@@ -852,7 +935,6 @@ class DeepgramLiveRelayConnection
      * Save a binary MediaRecorder chunk and compute its embedding.
      * Returns the saved chunk metadata (also stored on $this->audioChunks).
      *
-     * @param string $bytes
      * @return array{start:float,end:float,path:string,embedding:array<int,float>|null,assigned_label:string|null}
      */
     private function ingestAudioChunk(int $meetingId, string $bytes): array
@@ -860,15 +942,15 @@ class DeepgramLiveRelayConnection
         $dir = "meeting_live_ws/{$meetingId}";
         $idx = $this->audioChunkIndex++;
         $rel = "{$dir}/chunk_{$idx}.webm";
-        Storage::put($rel, $bytes);
-        $abs = Storage::path($rel);
+        Storage::disk('local')->put($rel, $bytes);
+        $abs = Storage::disk('local')->path($rel);
 
         // Keep a single growing WebM that DOES contain a proper header.
         // MediaRecorder timeslices often yield chunks that are not standalone-decodable (missing EBML header),
         // but appending the bytes preserves a valid stream container for ffmpeg trimming by time range.
         if ($this->streamWebmPath === null) {
             $streamRel = "{$dir}/stream.webm";
-            $this->streamWebmPath = Storage::path($streamRel);
+            $this->streamWebmPath = Storage::disk('local')->path($streamRel);
         }
         try {
             @file_put_contents((string) $this->streamWebmPath, $bytes, \FILE_APPEND);
@@ -898,7 +980,6 @@ class DeepgramLiveRelayConnection
     /**
      * Ingest a PCM16LE 16kHz mono chunk.
      *
-     * @param string $bytes
      * @return array{start:float,end:float,path:string,embedding:array<int,float>|null,assigned_label:string|null}
      */
     private function ingestPcmChunk(int $meetingId, string $bytes): array
@@ -906,8 +987,8 @@ class DeepgramLiveRelayConnection
         $dir = "meeting_live_ws/{$meetingId}";
         $idx = $this->audioChunkIndex++;
         $rel = "{$dir}/chunk_{$idx}.pcm";
-        Storage::put($rel, $bytes);
-        $abs = Storage::path($rel);
+        Storage::disk('local')->put($rel, $bytes);
+        $abs = Storage::disk('local')->path($rel);
 
         $bytesPerSecond = $this->pcmSampleRate * 2; // int16 mono
         $dur = $bytesPerSecond > 0 ? (strlen($bytes) / $bytesPerSecond) : 0.0;
@@ -919,12 +1000,10 @@ class DeepgramLiveRelayConnection
 
         // Lightweight VAD so we can start voice attribution immediately, even before STT emits words/utterances.
         // Deepgram diarization can lag or collapse to one label in mono streams; this keeps "recent speech" hot.
-        $vadThr = (float) env('MEETING_PCM_VAD_THRESHOLD', 900.0);
+        $vadThr = MeetingLiveTuning::float('live.pcm_vad_threshold', 900.0);
         $vadThr = max(50.0, min(8000.0, $vadThr));
-        // Mobile PCM amplitudes can be much lower than browser recordings.
-        // If we have enrolled voiceprints, cap the threshold so speech is detected promptly.
         if (count($this->enrolledVoiceprints) >= 1) {
-            $vadThr = min($vadThr, 300.0);
+            $vadThr = min($vadThr, MeetingLiveTuning::float('live.pcm_vad_cap_with_enrollment', 300.0));
         }
         $energy = $this->pcmAvgAbs16($bytes);
         if ($energy >= $vadThr) {
@@ -948,9 +1027,10 @@ class DeepgramLiveRelayConnection
         $this->pruneAudioBuffers();
 
         // Kick fallback attribution promptly on speech (otherwise we wait for the embed timer tick).
-        if (!$this->voiceEmbeddingBusy) {
+        if (! $this->voiceEmbeddingBusy) {
             try {
                 $this->maybeAttributeWithoutDiarization($meetingId);
+                $this->maybeFastIdentifyEnrolledLabels($meetingId);
             } catch (Throwable) {
             }
         }
@@ -981,6 +1061,7 @@ class DeepgramLiveRelayConnection
             $sum += abs((int) $v);
             $count++;
         }
+
         return $count > 0 ? ($sum / $count) : 0.0;
     }
 
@@ -998,7 +1079,7 @@ class DeepgramLiveRelayConnection
     private function appendSpeakerText(string $label, string $text): void
     {
         $existing = (string) ($this->cumulativeSpeakerText[$label] ?? '');
-        $combined = trim($existing . ' ' . trim($text));
+        $combined = trim($existing.' '.trim($text));
         if (mb_strlen($combined) > $this->maxTranscriptCharsPerLabel) {
             $combined = mb_substr($combined, -1 * $this->maxTranscriptCharsPerLabel);
         }
@@ -1026,11 +1107,12 @@ class DeepgramLiveRelayConnection
         if (in_array($s, ['0', 'false', 'no', 'n', 'off'], true)) {
             return false;
         }
+
         return $default;
     }
 
     /**
-     * @param array<string,mixed> $data
+     * @param  array<string,mixed>  $data
      * @return array<string,mixed>|null
      */
     private function firstDeepgramAlternative(array $data): ?array
@@ -1038,56 +1120,82 @@ class DeepgramLiveRelayConnection
         $alt =
             ($data['channel']['alternatives'][0] ?? null)
             ?? ($data['results']['channels'][0]['alternatives'][0] ?? null);
+
         return is_array($alt) ? $alt : null;
     }
 
     /**
-     * @param array<string,mixed> $data
+     * @param  array<string,mixed>  $data
      */
     private function channelLevelTranscript(array $data): string
     {
         $alt = $this->firstDeepgramAlternative($data);
-        if (!$alt) {
+        if (! $alt) {
             return '';
         }
+
         return trim((string) ($alt['transcript'] ?? ''));
     }
 
     /**
-     * @param array<int,mixed>|null $words
+     * @param  array<int,mixed>|null  $words
      */
     private function firstSpeakerFromWords(?array $words): ?int
     {
-        if (!is_array($words)) {
+        if (! is_array($words)) {
             return null;
         }
         foreach ($words as $w) {
-            if (!is_array($w)) {
+            if (! is_array($w)) {
                 continue;
             }
             if (array_key_exists('speaker', $w) && $w['speaker'] !== null && $w['speaker'] !== '') {
                 return (int) $w['speaker'];
             }
         }
+
         return null;
     }
 
     private function guessSpeakerLabelFromRecentIntervals(): string
     {
-        if (count($this->recentSpeakerIntervals) === 0) {
-            return 'speaker_0';
+        if ($this->activeSpeakerLabel !== '') {
+            return (string) $this->activeSpeakerLabel;
         }
-        $last = $this->recentSpeakerIntervals[count($this->recentSpeakerIntervals) - 1];
-        $lab = (string) ($last['label'] ?? '');
-        return $lab !== '' ? $lab : 'speaker_0';
+
+        foreach ($this->lastVoiceMatching as $label => $vm) {
+            if (! is_array($vm) || ! (bool) ($vm['matched'] ?? false)) {
+                continue;
+            }
+            $lab = trim((string) $label);
+            if ($lab !== '') {
+                return $lab;
+            }
+        }
+
+        if (count($this->recentSpeakerIntervals) > 0) {
+            $last = $this->recentSpeakerIntervals[count($this->recentSpeakerIntervals) - 1];
+            $lab = (string) ($last['label'] ?? '');
+            if ($lab !== '') {
+                return $lab;
+            }
+        }
+
+        foreach (array_keys($this->livePartialByLabel) as $label) {
+            if (trim((string) ($this->livePartialByLabel[$label] ?? '')) !== '') {
+                return (string) $label;
+            }
+        }
+
+        return count($this->enrolledVoiceprints) >= 2 ? 'speaker_unknown' : 'speaker_0';
     }
 
     /**
      * Deepgram often sends interim results as channel.alternatives[0].transcript with an empty words array.
      * Those messages were previously dropped entirely, which makes the UI look "stuck then burst".
      *
-     * @param array<string,mixed> $data
-     * @param array<int,mixed>|null $words
+     * @param  array<string,mixed>  $data
+     * @param  array<int,mixed>|null  $words
      */
     private function applyChannelTranscriptFallback(
         array $data,
@@ -1114,10 +1222,11 @@ class DeepgramLiveRelayConnection
             || $this->deepgramBool($data['speech_final'] ?? null, false);
 
         $sp = $this->firstSpeakerFromWords($words);
-        $label = $sp === null ? $this->guessSpeakerLabelFromRecentIntervals() : ('speaker_' . $sp);
+        $label = $sp === null ? $this->guessSpeakerLabelFromRecentIntervals() : ('speaker_'.$sp);
 
-        if (!$isFinal) {
+        if (! $isFinal) {
             $this->livePartialByLabel[$label] = $t;
+
             return;
         }
 
@@ -1125,18 +1234,18 @@ class DeepgramLiveRelayConnection
         $partial = trim((string) ($this->livePartialByLabel[$label] ?? ''));
         unset($this->livePartialByLabel[$label]);
 
-        $chunk = trim($partial === '' ? $t : ($partial . ' ' . $t));
+        $chunk = trim($partial === '' ? $t : ($partial.' '.$t));
         if ($chunk === '') {
             return;
         }
 
         // Finals should still be de-duped, but interim refresh should not be keyed by md5(text) alone.
-        $segKey = $label . '|channel_final|' . md5($chunk);
+        $segKey = $label.'|channel_final|'.md5($chunk);
         if (isset($this->seenTranscriptSegments[$segKey])) {
             return;
         }
         $this->seenTranscriptSegments[$segKey] = $now;
-        $speakerText[$label] = ($speakerText[$label] ?? '') . ' ' . $chunk;
+        $speakerText[$label] = ($speakerText[$label] ?? '').' '.$chunk;
     }
 
     private function writeWavPcm16(string $wavPath, string $pcmBytes, int $sampleRate): void
@@ -1149,21 +1258,21 @@ class DeepgramLiveRelayConnection
         $riffSize = 36 + $dataSize;
 
         $hdr =
-            "RIFF" .
-            pack('V', $riffSize) .
-            "WAVE" .
-            "fmt " .
-            pack('V', 16) .           // fmt chunk size
-            pack('v', 1) .            // PCM
-            pack('v', $numChannels) .
-            pack('V', $sampleRate) .
-            pack('V', $byteRate) .
-            pack('v', $blockAlign) .
-            pack('v', $bitsPerSample) .
-            "data" .
+            'RIFF'.
+            pack('V', $riffSize).
+            'WAVE'.
+            'fmt '.
+            pack('V', 16).           // fmt chunk size
+            pack('v', 1).            // PCM
+            pack('v', $numChannels).
+            pack('V', $sampleRate).
+            pack('V', $byteRate).
+            pack('v', $blockAlign).
+            pack('v', $bitsPerSample).
+            'data'.
             pack('V', $dataSize);
 
-        file_put_contents($wavPath, $hdr . $pcmBytes);
+        file_put_contents($wavPath, $hdr.$pcmBytes);
     }
 
     private function probeDurationSeconds(string $absolutePath): float
@@ -1223,15 +1332,17 @@ class DeepgramLiveRelayConnection
                 'stderr' => trim((string) $stderr),
                 'error' => is_array($decoded) ? ($decoded['error'] ?? null) : null,
             ]);
+
             return null;
         }
         $decoded = json_decode($stdout, true);
-        if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
+        if (! is_array($decoded) || ! is_array($decoded['embedding'] ?? null)) {
             $this->debugVoice('embed_invalid_json', [
                 'stdout' => trim($stdout),
                 'stderr' => trim((string) $stderr),
                 'decoded_error' => is_array($decoded) ? ($decoded['error'] ?? null) : null,
             ]);
+
             return null;
         }
         $vec = [];
@@ -1240,6 +1351,7 @@ class DeepgramLiveRelayConnection
                 $vec[] = (float) $v;
             }
         }
+
         return count($vec) > 0 ? $vec : null;
     }
 
@@ -1256,6 +1368,7 @@ class DeepgramLiveRelayConnection
             $existing !== '' ? explode(':', $existing) : [],
             $candidates,
         )));
+
         return implode(':', $parts);
     }
 
@@ -1268,7 +1381,7 @@ class DeepgramLiveRelayConnection
     {
         $env = [];
         foreach (array_merge($_SERVER, $_ENV) as $k => $v) {
-            if (!is_string($k) || $k === '') {
+            if (! is_string($k) || $k === '') {
                 continue;
             }
             if (is_string($v) || is_int($v) || is_float($v)) {
@@ -1283,7 +1396,7 @@ class DeepgramLiveRelayConnection
     /**
      * Run a subprocess without blocking the WebSocket event loop (Amp + Revolt).
      *
-     * @param list<string> $command
+     * @param  list<string>  $command
      * @return array{0:int,1:string,2:string} exit code, stdout, stderr
      */
     private function runSubprocess(array $command): array
@@ -1341,7 +1454,7 @@ class DeepgramLiveRelayConnection
             try {
                 $join = $proc->join();
                 // amphp/process v2: join() returns Future<int>.
-                if ($join instanceof \Amp\Future) {
+                if ($join instanceof Future) {
                     $exitCode = (int) $join->await();
                 } else {
                     $exitCode = (int) $join;
@@ -1350,15 +1463,21 @@ class DeepgramLiveRelayConnection
                 $exitCode = 125;
             } finally {
                 $done = true;
-                try { EventLoop::cancel($timerId); } catch (Throwable) {}
+                try {
+                    EventLoop::cancel($timerId);
+                } catch (Throwable) {
+                }
                 $resumeOnce(true);
             }
         });
 
         $ok = (bool) $suspension->suspend();
-        if (!$ok) {
+        if (! $ok) {
             // Timeout hit.
-            try { $proc->signal(\SIGKILL); } catch (Throwable) {}
+            try {
+                $proc->signal(\SIGKILL);
+            } catch (Throwable) {
+            }
             $exitCode = 124;
         }
 
@@ -1385,10 +1504,10 @@ class DeepgramLiveRelayConnection
 
         $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
         $trimBase = tempnam(sys_get_temp_dir(), 'wchirp_trim_') ?: null;
-        if (!$trimBase) {
+        if (! $trimBase) {
             return null;
         }
-        $trimPath = $trimBase . '.wav';
+        $trimPath = $trimBase.'.wav';
 
         try {
             if ($this->audioFormat === 'pcm16') {
@@ -1437,17 +1556,17 @@ class DeepgramLiveRelayConnection
                 $this->writeWavPcm16($trimPath, $pcm, $this->pcmSampleRate);
             } else {
                 $streamPath = $this->streamWebmPath;
-                if (!$streamPath || !is_file($streamPath)) {
+                if (! $streamPath || ! is_file($streamPath)) {
                     return null;
                 }
                 $snapBase = tempnam(sys_get_temp_dir(), 'wchirp_ws_stream_') ?: null;
-                if (!$snapBase) {
+                if (! $snapBase) {
                     return null;
                 }
-                $snapPath = $snapBase . '.webm';
+                $snapPath = $snapBase.'.webm';
                 try {
                     @copy($streamPath, $snapPath);
-                    if (!is_file($snapPath) || filesize($snapPath) < 1024) {
+                    if (! is_file($snapPath) || filesize($snapPath) < 1024) {
                         return null;
                     }
 
@@ -1473,6 +1592,7 @@ class DeepgramLiveRelayConnection
                             'exit' => $ffExit,
                             'stderr' => trim($ffErr),
                         ]);
+
                         return null;
                     }
                 } finally {
@@ -1482,12 +1602,13 @@ class DeepgramLiveRelayConnection
             }
 
             $vec = $this->computeEmbedding($trimPath);
-            if (!$vec) {
+            if (! $vec) {
                 $this->debugVoice('embed_failed', [
                     'meeting_id' => $meetingId,
                     'range_start' => $rangeStart,
                     'range_end' => $rangeEnd,
                 ]);
+
                 return null;
             }
             $this->debugVoice('embed_ok', [
@@ -1496,6 +1617,7 @@ class DeepgramLiveRelayConnection
                 'range_end' => $rangeEnd,
                 'dim' => count($vec),
             ]);
+
             return $vec;
         } finally {
             @unlink($trimPath);
@@ -1526,11 +1648,17 @@ class DeepgramLiveRelayConnection
         $maxEndByLabel = [];
         foreach ($this->recentSpeakerIntervals as $it) {
             $label = (string) ($it['label'] ?? '');
-            if ($label === '') continue;
+            if ($label === '') {
+                continue;
+            }
             $s = (float) ($it['start'] ?? 0.0);
             $e = (float) ($it['end'] ?? 0.0);
-            if ($e <= $s) continue;
-            if ($e < $windowStart) continue;
+            if ($e <= $s) {
+                continue;
+            }
+            if ($e < $windowStart) {
+                continue;
+            }
 
             $s2 = max($s, $windowStart);
             $speechByLabel[$label] = ($speechByLabel[$label] ?? 0.0) + ($e - $s2);
@@ -1568,6 +1696,7 @@ class DeepgramLiveRelayConnection
             }
             $sa = (float) ($speechByLabel[$a] ?? 0.0);
             $sb = (float) ($speechByLabel[$b] ?? 0.0);
+
             return $sb <=> $sa;
         });
 
@@ -1592,6 +1721,7 @@ class DeepgramLiveRelayConnection
                     'min_speech_seconds' => $effectiveMinSpeech,
                     'window_seconds' => $this->labelWindowSeconds,
                 ]);
+
                 continue;
             }
 
@@ -1603,6 +1733,7 @@ class DeepgramLiveRelayConnection
                     'since_last_seconds' => ($now - $last),
                     'cooldown_seconds' => $this->labelEmbedCooldownSeconds,
                 ]);
+
                 continue;
             }
             $this->labelLastEmbedAt[$label] = $now;
@@ -1620,6 +1751,7 @@ class DeepgramLiveRelayConnection
                     'purity' => $purity,
                     'min_purity' => $this->labelMinPurity,
                 ]);
+
                 continue;
             }
 
@@ -1637,7 +1769,7 @@ class DeepgramLiveRelayConnection
             async(function () use ($meetingId, $label, $rangeStart, $rangeEnd): void {
                 try {
                     $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
-                    if (!is_array($vec) || count($vec) === 0) {
+                    if (! is_array($vec) || count($vec) === 0) {
                         $this->debugVoice('label_embed_empty', [
                             'meeting_id' => $meetingId,
                             'label' => $label,
@@ -1690,13 +1822,15 @@ class DeepgramLiveRelayConnection
         }
         $recentSpeech = $this->lastActiveSpeakerAt > 0.0 && ($now - $this->lastActiveSpeakerAt) <= 0.8;
         $cur = max(0.0, (float) $this->audioCursorSeconds);
-        if (!$recentSpeech) {
+        if (! $recentSpeech) {
             $this->fallbackLastAttributionCursor = max($this->fallbackLastAttributionCursor, $cur);
+
             return;
         }
 
         if ($this->fallbackLastAttributionCursor <= 0.0) {
             $this->fallbackLastAttributionCursor = $cur;
+
             return;
         }
 
@@ -1707,6 +1841,7 @@ class DeepgramLiveRelayConnection
         if ($delta > 1.25) {
             // Don't backfill large gaps (reconnect / pause).
             $this->fallbackLastAttributionCursor = $cur;
+
             return;
         }
 
@@ -1715,7 +1850,7 @@ class DeepgramLiveRelayConnection
         // If the window is too long, it contains both speakers and keeps matching the dominant one.
         // Rolling window classification (seconds). 1.0s is a good balance:
         // enough phonetic content to be stable, short enough to switch quickly.
-        $fallbackWindow = (float) env('MEETING_WS_FALLBACK_WINDOW_SECONDS', 1.0);
+        $fallbackWindow = MeetingLiveTuning::float('live.fallback_window_seconds', 1.0);
         $fallbackWindow = max(0.35, min(4.0, $fallbackWindow));
         $window = min($this->labelWindowSeconds, $fallbackWindow);
         $rangeStart = max(0.0, $rangeEnd - $window);
@@ -1725,12 +1860,13 @@ class DeepgramLiveRelayConnection
         async(function () use ($meetingId, $rangeStart, $rangeEnd, $delta): void {
             try {
                 $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
-                if (!is_array($vec) || count($vec) === 0) {
+                if (! is_array($vec) || count($vec) === 0) {
                     $this->debugVoice('fallback_embed_empty', [
                         'meeting_id' => $meetingId,
                         'range_start' => $rangeStart,
                         'range_end' => $rangeEnd,
                     ]);
+
                     return;
                 }
 
@@ -1755,7 +1891,7 @@ class DeepgramLiveRelayConnection
                 }
                 // Light decay for participants not present in this frame.
                 foreach ($ema as $pid => $p) {
-                    if (!array_key_exists((int) $pid, $posterior)) {
+                    if (! array_key_exists((int) $pid, $posterior)) {
                         $ema[(int) $pid] = (float) ($p * (1.0 - ($alpha * 0.20)));
                     }
                 }
@@ -1816,6 +1952,7 @@ class DeepgramLiveRelayConnection
                         'range_end' => $rangeEnd,
                         '_fallback_last' => $this->lastFallbackMatching,
                     ]);
+
                     return;
                 }
 
@@ -1854,6 +1991,7 @@ class DeepgramLiveRelayConnection
             $end = (float) $chunk['end'];
             if ($end <= $start) {
                 $this->audioChunks[$i]['assigned_label'] = 'speaker_unknown';
+
                 continue;
             }
 
@@ -1879,14 +2017,14 @@ class DeepgramLiveRelayConnection
     }
 
     /**
-     * @param array<int,float> $vec
+     * @param  array<int,float>  $vec
      */
     private function accumulateVoiceprint(string $label, array $vec): void
     {
         $max = (int) env('MEETING_WS_ROLLING_EMBED_COUNT', 5);
         $max = max(1, min(10, $max));
 
-        if (!isset($this->speakerVoiceprintHistory[$label])) {
+        if (! isset($this->speakerVoiceprintHistory[$label])) {
             $this->speakerVoiceprintHistory[$label] = [];
         }
         $this->speakerVoiceprintHistory[$label][] = array_map('floatval', $vec);
@@ -1901,7 +2039,7 @@ class DeepgramLiveRelayConnection
     private function getVoiceprintForLabel(string $label): ?array
     {
         $hist = $this->speakerVoiceprintHistory[$label] ?? null;
-        if (!is_array($hist) || count($hist) < 1) {
+        if (! is_array($hist) || count($hist) < 1) {
             return null;
         }
 
@@ -1931,12 +2069,13 @@ class DeepgramLiveRelayConnection
         for ($i = 0; $i < count($avg); $i++) {
             $avg[$i] = $avg[$i] / $norm;
         }
+
         return ['vec' => $avg, 'count' => $count];
     }
 
     /**
-     * @param array<int,float> $a
-     * @param array<int,float> $b
+     * @param  array<int,float>  $a
+     * @param  array<int,float>  $b
      */
     private function cosineSimilarity(array $a, array $b): float
     {
@@ -1957,11 +2096,12 @@ class DeepgramLiveRelayConnection
         if ($na <= 0.0 || $nb <= 0.0) {
             return 0.0;
         }
+
         return $dot / (sqrt($na) * sqrt($nb));
     }
 
     /**
-     * @param array<int,float> $scores participant_id => cosine score
+     * @param  array<int,float>  $scores  participant_id => cosine score
      * @return array<int,float> participant_id => probability (sums to ~1)
      */
     private function softmaxPosteriors(array $scores): array
@@ -1990,11 +2130,12 @@ class DeepgramLiveRelayConnection
             $out[(int) $pid] = (float) ($e / $sum);
         }
         arsort($out);
+
         return $out;
     }
 
     /**
-     * @param array<int,float> $posterior participant_id => probability
+     * @param  array<int,float>  $posterior  participant_id => probability
      * @return array{pid:int,p:float,second_p:float,entropy:float}
      */
     private function posteriorSummary(array $posterior): array
@@ -2011,11 +2152,12 @@ class DeepgramLiveRelayConnection
             $pp = max(1e-12, (float) $p);
             $h += -1.0 * $pp * log($pp);
         }
+
         return ['pid' => $pid, 'p' => $p1, 'second_p' => $p2, 'entropy' => $h];
     }
 
     /**
-     * @param array<int,float> $vec
+     * @param  array<int,float>  $vec
      * @return array{scores:array<int,float>,posterior:array<int,float>}
      */
     private function scoreAllParticipants(array $vec): array
@@ -2027,16 +2169,17 @@ class DeepgramLiveRelayConnection
                 continue;
             }
             $vec2 = $e['vector'] ?? null;
-            if (!is_array($vec2) || count($vec2) < 32) {
+            if (! is_array($vec2) || count($vec2) < 32) {
                 continue;
             }
             $s = $this->cosineSimilarity($vec, $vec2);
-            if (!isset($bestByPid[$pid]) || $s > (float) $bestByPid[$pid]) {
+            if (! isset($bestByPid[$pid]) || $s > (float) $bestByPid[$pid]) {
                 $bestByPid[$pid] = (float) $s;
             }
         }
         arsort($bestByPid);
         $posterior = $this->softmaxPosteriors($bestByPid);
+
         return ['scores' => $bestByPid, 'posterior' => $posterior];
     }
 
@@ -2052,11 +2195,12 @@ class DeepgramLiveRelayConnection
                 $pids[$pid] = true;
             }
         }
+
         return count($pids);
     }
 
     /**
-     * @param array<int,float> $vec
+     * @param  array<int,float>  $vec
      * @return array{0:int,1:float}|null
      */
     private function matchVoiceprint(array $vec, int $evidenceCount = 1): ?array
@@ -2064,16 +2208,13 @@ class DeepgramLiveRelayConnection
         if (count($this->enrolledVoiceprints) === 0) {
             return null;
         }
-        $threshold = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
-        $minMargin = (float) (env('MEETING_VOICEPRINT_MARGIN', 0.05));
-        // In 2-participant meetings, margins are often very small on mobile/mono streams.
-        // Reduce the required margin to avoid "never matched" behavior.
+        $threshold = MeetingLiveTuning::float('voiceprint.threshold', 0.78);
+        $minMargin = MeetingLiveTuning::float('voiceprint.margin', 0.06);
         if ($this->enrolledParticipantCount() === 2) {
-            $minMargin = min($minMargin, (float) env('MEETING_VOICEPRINT_MARGIN_2P', 0.006));
+            $minMargin = min($minMargin, MeetingLiveTuning::float('voiceprint.margin_2p', 0.012));
         }
-        // If we only have 1 chunk of evidence, require a stronger score to avoid early mislabels.
         if ($evidenceCount < 2) {
-            $threshold += (float) (env('MEETING_VOICEPRINT_EARLY_BOOST', 0.07));
+            $threshold += MeetingLiveTuning::float('voiceprint.early_boost', 0.05);
         }
         // Compute best score PER participant_id (participants can have multiple templates).
         $bestByPid = [];
@@ -2083,7 +2224,7 @@ class DeepgramLiveRelayConnection
                 continue;
             }
             $score = $this->cosineSimilarity($vec, $e['vector']);
-            if (!isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+            if (! isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
                 $bestByPid[$pid] = (float) $score;
             }
         }
@@ -2098,6 +2239,7 @@ class DeepgramLiveRelayConnection
         if (($bestScore - max(-1.0, $secondBest)) < $minMargin) {
             return null;
         }
+
         return [$bestId, $bestScore];
     }
 
@@ -2111,13 +2253,13 @@ class DeepgramLiveRelayConnection
             return null;
         }
 
-        $base = (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75));
-        $threshold = (float) env('MEETING_VOICEPRINT_FALLBACK_THRESHOLD', max(0.40, $base - 0.12));
-        // Allow lower fallback thresholds for mono/mobile where ECAPA cosine can be ~0.15–0.30.
+        $base = MeetingLiveTuning::float('voiceprint.threshold', 0.78);
+        $configuredFallback = MeetingLiveTuning::float('voiceprint.fallback_threshold', 0.0);
+        $threshold = $configuredFallback > 0 ? $configuredFallback : max(0.40, $base - 0.10);
         $threshold = max(0.15, min(0.95, $threshold));
-        $minMargin = (float) env('MEETING_VOICEPRINT_FALLBACK_MARGIN', 0.015);
+        $minMargin = MeetingLiveTuning::float('voiceprint.fallback_margin', 0.02);
         if ($this->enrolledParticipantCount() === 2) {
-            $minMargin = min($minMargin, (float) env('MEETING_VOICEPRINT_FALLBACK_MARGIN_2P', 0.006));
+            $minMargin = min($minMargin, MeetingLiveTuning::float('voiceprint.fallback_margin_2p', 0.008));
         }
         $minMargin = max(0.0, min(0.2, $minMargin));
 
@@ -2129,7 +2271,7 @@ class DeepgramLiveRelayConnection
                 continue;
             }
             $score = $this->cosineSimilarity($vec, $e['vector']);
-            if (!isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+            if (! isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
                 $bestByPid[$pid] = (float) $score;
             }
         }
@@ -2158,17 +2300,18 @@ class DeepgramLiveRelayConnection
         if (($bestScore - max(-1.0, $secondBest)) < $effectiveMinMargin) {
             return null;
         }
+
         return [$bestId, $bestScore];
     }
 
     private function debugVoice(string $event, array $ctx = []): void
     {
-        if (!$this->voiceDebug) {
+        if (! $this->voiceDebug) {
             return;
         }
         try {
-            Log::info('voiceprint_debug.' . $event, $ctx);
-        } catch (\Throwable) {
+            Log::info('voiceprint_debug.'.$event, $ctx);
+        } catch (Throwable) {
         }
     }
 
@@ -2178,24 +2321,26 @@ class DeepgramLiveRelayConnection
         string $sanctumToken,
         string $format = 'webm',
         bool $transcriptEnabled = true
-    ): void
-    {
+    ): void {
         if ($meetingId <= 0) {
             $frontend->close();
+
             return;
         }
 
         $user = $this->authenticate($sanctumToken);
-        if (!$user) {
+        if (! $user) {
             $frontend->sendText(json_encode(['error' => 'unauthenticated']));
             $frontend->close();
+
             return;
         }
 
         $meeting = Meeting::query()->whereKey($meetingId)->where('host_id', $user->id)->first();
-        if (!$meeting) {
+        if (! $meeting) {
             $frontend->sendText(json_encode(['error' => 'meeting_not_found']));
             $frontend->close();
+
             return;
         }
 
@@ -2237,6 +2382,7 @@ class DeepgramLiveRelayConnection
                     'hint' => 'Set PULSE_API_KEY in .env (and MEETING_STT_PROVIDER=pulse).',
                 ]));
                 $frontend->close();
+
                 return;
             }
             // Pulse realtime API expects raw PCM/opus per docs; our browser sends pcm16.
@@ -2246,12 +2392,14 @@ class DeepgramLiveRelayConnection
                     'hint' => 'Use format=pcm16 on the live WebSocket URL (demo default).',
                 ]));
                 $frontend->close();
+
                 return;
             }
         } else {
             if ($deepgramKey === '') {
                 $frontend->sendText(json_encode(['error' => 'deepgram_key_missing']));
                 $frontend->close();
+
                 return;
             }
         }
@@ -2261,14 +2409,12 @@ class DeepgramLiveRelayConnection
         $this->loadEnrolledParticipants($meetingId);
         $this->loadEnrolledVoiceprints($meetingId);
         $this->loadEnrolledParticipantIndex($meetingId);
-        $this->embedEveryN = max(1, (int) (env('MEETING_WS_EMBED_EVERY_N', 5)));
-        $this->bootstrapChunks = max(1, (int) (env('MEETING_WS_BOOTSTRAP_CHUNKS', 8)));
-        // Faster, more "instant" identity locking defaults (tunable via .env).
-        // Keep these conservative enough to avoid flicker, but responsive for live UI.
-        $this->labelWindowSeconds = (float) (env('MEETING_WS_LABEL_WINDOW_SECONDS', 2.0));          // evidence window
-        $this->labelMinSpeechSeconds = (float) (env('MEETING_WS_LABEL_MIN_SPEECH_SECONDS', 1.0));   // minimum speech to embed
-        $this->labelEmbedCooldownSeconds = (float) (env('MEETING_WS_LABEL_EMBED_COOLDOWN_SECONDS', 1.5));
-        $this->labelMinPurity = (float) (env('MEETING_WS_LABEL_MIN_PURITY', 0.65));
+        $this->embedEveryN = max(1, MeetingLiveTuning::int('live.embed_every_n', 5));
+        $this->bootstrapChunks = max(1, MeetingLiveTuning::int('live.bootstrap_chunks', 8));
+        $this->labelWindowSeconds = MeetingLiveTuning::float('live.label_window_seconds', 8.0);
+        $this->labelMinSpeechSeconds = MeetingLiveTuning::float('live.label_min_speech_seconds', 2.5);
+        $this->labelEmbedCooldownSeconds = MeetingLiveTuning::float('live.label_embed_cooldown_seconds', 4.0);
+        $this->labelMinPurity = MeetingLiveTuning::float('live.label_min_purity', 0.65);
         if (count($this->enrolledVoiceprints) >= 2) {
             // Multi-participant meetings: keep matching fast but require enough speech
             // to avoid "everyone scores the same" on tiny/noisy fragments.
@@ -2288,9 +2434,9 @@ class DeepgramLiveRelayConnection
             $this->labelMinPurity = min($this->labelMinPurity, 0.35);
             $this->labelEmbedCooldownSeconds = min($this->labelEmbedCooldownSeconds, 2.0);
         }
-        $this->voiceDebug = (bool) (env('MEETING_VOICEPRINT_DEBUG', false));
-        $this->maxAudioKeepSeconds = (float) (env('MEETING_WS_MAX_AUDIO_KEEP_SECONDS', 35));
-        $this->maxTranscriptCharsPerLabel = (int) (env('MEETING_WS_MAX_TRANSCRIPT_CHARS', 6000));
+        $this->voiceDebug = MeetingLiveTuning::bool('voiceprint.debug', false);
+        $this->maxAudioKeepSeconds = MeetingLiveTuning::float('live.max_audio_keep_seconds', 35.0);
+        $this->maxTranscriptCharsPerLabel = MeetingLiveTuning::int('live.max_transcript_chars', 6000);
 
         $upstream = $sttProvider === 'pulse'
             ? $this->connectPulse($pulseKey)
@@ -2298,8 +2444,8 @@ class DeepgramLiveRelayConnection
 
         // Coalesce frontend updates on timers (prevents 1006 from browser overload).
         // User-facing "bar update" cadence is controlled here (default 100ms ≈ realtime feel).
-        $statsIntervalSeconds = (float) (env('MEETING_WS_STATS_INTERVAL_SECONDS', 0.1));
-        $statsIntervalSeconds = max(0.05, min(2.0, $statsIntervalSeconds)); // safety clamp
+        $statsIntervalSeconds = MeetingLiveTuning::float('live.stats_interval_seconds', 0.1);
+        $statsIntervalSeconds = max(0.05, min(2.0, $statsIntervalSeconds));
         $this->statsTimerId = EventLoop::repeat($statsIntervalSeconds, function () use ($frontend, $meetingId) {
             if ($frontend->isClosed()) {
                 return;
@@ -2315,13 +2461,18 @@ class DeepgramLiveRelayConnection
                     'event' => 'stats.updated',
                     'message' => $e->getMessage(),
                 ]);
-                try { $frontend->close(WebsocketCloseCode::INTERNAL_ERROR, 'frontend_send_failed'); } catch (Throwable) {}
+                try {
+                    $frontend->close(WebsocketCloseCode::INTERNAL_ERROR, 'frontend_send_failed');
+                } catch (Throwable) {
+                }
             }
         });
 
         // Transcript updates timer: fallback path for UI smoothness.
         if ($this->transcriptEnabled) {
-            $this->transcriptTimerId = EventLoop::repeat(0.03, function () use ($frontend, $meetingId) {
+            $transcriptPushSeconds = MeetingLiveTuning::float('live.transcript_push_interval_seconds', 0.03);
+            $transcriptPushSeconds = max(0.02, min(0.25, $transcriptPushSeconds));
+            $this->transcriptTimerId = EventLoop::repeat($transcriptPushSeconds, function () use ($frontend, $meetingId) {
                 if ($frontend->isClosed()) {
                     return;
                 }
@@ -2333,7 +2484,10 @@ class DeepgramLiveRelayConnection
                         'event' => 'transcript.updated',
                         'message' => $e->getMessage(),
                     ]);
-                    try { $frontend->close(WebsocketCloseCode::INTERNAL_ERROR, 'frontend_send_failed'); } catch (Throwable) {}
+                    try {
+                        $frontend->close(WebsocketCloseCode::INTERNAL_ERROR, 'frontend_send_failed');
+                    } catch (Throwable) {
+                    }
                 }
             });
         }
@@ -2348,8 +2502,7 @@ class DeepgramLiveRelayConnection
 
         // Voice embedding is CPU-heavy (ffmpeg + python). Run slower and single-flight
         // so matching works without degrading live transcript latency.
-        $voiceEmbedIntervalSeconds = (float) (env('MEETING_WS_VOICE_EMBED_INTERVAL_SECONDS', 1.2));
-        // Multi-participant meetings: run fallback classification ~3x/sec.
+        $voiceEmbedIntervalSeconds = MeetingLiveTuning::float('live.voice_embed_interval_seconds', 1.2);
         if (count($this->enrolledVoiceprints) >= 2) {
             $voiceEmbedIntervalSeconds = min($voiceEmbedIntervalSeconds, 0.33);
         }
@@ -2360,6 +2513,7 @@ class DeepgramLiveRelayConnection
             }
             try {
                 $this->maybeAttributeWithoutDiarization($meetingId);
+                $this->maybeFastIdentifyEnrolledLabels($meetingId);
                 $this->maybeComputeLabelEmbeddings($meetingId);
             } catch (Throwable) {
             }
@@ -2383,7 +2537,7 @@ class DeepgramLiveRelayConnection
         // IMPORTANT: Never close the frontend WS when upstream disconnects.
         EventLoop::queue(function () use (&$upstream, $sttProvider, $deepgramKey, $pulseKey, $frontend, $meetingId) {
             $backoffMs = 500;
-            while (!$frontend->isClosed()) {
+            while (! $frontend->isClosed()) {
                 try {
                     while ($msg = $upstream->receive()) {
                         $text = $this->readClientMessage($msg);
@@ -2404,7 +2558,7 @@ class DeepgramLiveRelayConnection
                         if ($immediateStatsMin > 0.0 && ($now - $this->lastImmediateStatsPushAt) >= $immediateStatsMin) {
                             try {
                                 $snapshot = $this->buildSnapshot($meetingId);
-                                if ($snapshot && !$frontend->isClosed()) {
+                                if ($snapshot && ! $frontend->isClosed()) {
                                     $frontend->sendText(json_encode(['event' => 'stats.updated', 'data' => $snapshot]));
                                 }
                                 $this->lastImmediateStatsPushAt = $now;
@@ -2426,7 +2580,7 @@ class DeepgramLiveRelayConnection
                         'message' => $e->getMessage(),
                     ]);
                     try {
-                        if (!$frontend->isClosed()) {
+                        if (! $frontend->isClosed()) {
                             $frontend->sendText(json_encode([
                                 'event' => 'upstream_stt.disconnected',
                                 'provider' => $sttProvider,
@@ -2443,7 +2597,7 @@ class DeepgramLiveRelayConnection
                         : $this->connectDeepgram($deepgramKey);
                     $backoffMs = 500;
                     try {
-                        if (!$frontend->isClosed()) {
+                        if (! $frontend->isClosed()) {
                             $frontend->sendText(json_encode([
                                 'event' => 'upstream_stt.reconnected',
                                 'provider' => $sttProvider,
@@ -2464,10 +2618,16 @@ class DeepgramLiveRelayConnection
                 try {
                     $sleep = EventLoop::getSuspension();
                     $timer = EventLoop::delay(max(0.01, (float) $backoffMs / 1000.0), static function () use ($sleep): void {
-                        try { $sleep->resume(true); } catch (Throwable) {}
+                        try {
+                            $sleep->resume(true);
+                        } catch (Throwable) {
+                        }
                     });
                     $sleep->suspend();
-                    try { EventLoop::cancel($timer); } catch (Throwable) {}
+                    try {
+                        EventLoop::cancel($timer);
+                    } catch (Throwable) {
+                    }
                 } catch (Throwable) {
                 }
             }
@@ -2499,18 +2659,43 @@ class DeepgramLiveRelayConnection
                 'message' => $e->getMessage(),
             ]);
             try {
-                if (!$frontend->isClosed()) {
+                if (! $frontend->isClosed()) {
                     $frontend->close(WebsocketCloseCode::INTERNAL_ERROR, 'frontend_receive_failed');
                 }
             } catch (Throwable) {
             }
         } finally {
             // Cancel timers.
-            try { if ($this->statsTimerId) EventLoop::cancel($this->statsTimerId); } catch (Throwable) {}
-            try { if ($this->transcriptTimerId) EventLoop::cancel($this->transcriptTimerId); } catch (Throwable) {}
-            try { if ($this->maintenanceTimerId) EventLoop::cancel($this->maintenanceTimerId); } catch (Throwable) {}
-            try { if ($this->persistTimerId) EventLoop::cancel($this->persistTimerId); } catch (Throwable) {}
-            try { if ($this->voiceEmbedTimerId) EventLoop::cancel($this->voiceEmbedTimerId); } catch (Throwable) {}
+            try {
+                if ($this->statsTimerId) {
+                    EventLoop::cancel($this->statsTimerId);
+                }
+            } catch (Throwable) {
+            }
+            try {
+                if ($this->transcriptTimerId) {
+                    EventLoop::cancel($this->transcriptTimerId);
+                }
+            } catch (Throwable) {
+            }
+            try {
+                if ($this->maintenanceTimerId) {
+                    EventLoop::cancel($this->maintenanceTimerId);
+                }
+            } catch (Throwable) {
+            }
+            try {
+                if ($this->persistTimerId) {
+                    EventLoop::cancel($this->persistTimerId);
+                }
+            } catch (Throwable) {
+            }
+            try {
+                if ($this->voiceEmbedTimerId) {
+                    EventLoop::cancel($this->voiceEmbedTimerId);
+                }
+            } catch (Throwable) {
+            }
             try {
                 $upstream->close();
             } catch (Throwable) {
@@ -2526,14 +2711,17 @@ class DeepgramLiveRelayConnection
     private function authenticate(string $token): ?object
     {
         $pat = PersonalAccessToken::findToken($token);
+
         return $pat?->tokenable;
     }
 
     private function connectDeepgram(string $apiKey): ClientWebsocketConnection
     {
         $model = (string) (config('services.deepgram.live_model') ?: env('DEEPGRAM_LIVE_MODEL') ?: 'nova-3');
-        $endpointingMs = (int) (env('DEEPGRAM_LIVE_ENDPOINTING_MS', 120));
+        $endpointingMs = MeetingLiveTuning::int('live.endpointing_ms', 100);
         $endpointingMs = max(50, min(2000, $endpointingMs));
+        $utteranceEndMs = MeetingLiveTuning::int('live.utterance_end_ms', 900);
+        $utteranceEndMs = max($endpointingMs, min(5000, $utteranceEndMs));
 
         $params = [
             // Nova-3 tends to perform better for noisy / multi-speaker meeting audio.
@@ -2543,9 +2731,16 @@ class DeepgramLiveRelayConnection
             'smart_format' => 'true',
             'interim_results' => 'true',
             'utterances' => 'true',
-            // Lower endpointing => more frequent partial/final cadence (less "stuck then dump").
             'endpointing' => (string) $endpointingMs,
+            'utterance_end_ms' => (string) $utteranceEndMs,
         ];
+        if (MeetingLiveTuning::bool('live.vad_events', true)) {
+            $params['vad_events'] = 'true';
+        }
+        $lang = MeetingLiveTuning::string('deepgram_language', 'en');
+        if ($lang !== '') {
+            $params['language'] = $lang;
+        }
         if ($this->audioFormat === 'pcm16') {
             $params['encoding'] = 'linear16';
             $params['sample_rate'] = (string) $this->pcmSampleRate;
@@ -2580,13 +2775,13 @@ class DeepgramLiveRelayConnection
         ];
         $query = http_build_query($params);
         $handshake = new WebsocketHandshake("wss://api.smallest.ai/waves/v1/pulse/get_text?{$query}");
-        $handshake = $handshake->withHeader('Authorization', 'Bearer ' . $apiKey);
+        $handshake = $handshake->withHeader('Authorization', 'Bearer '.$apiKey);
 
         return connect($handshake);
     }
 
     /**
-     * @param array<string,mixed> $p
+     * @param  array<string,mixed>  $p
      */
     private function pulseResponseToUnifiedSttJson(array $p): string
     {
@@ -2605,7 +2800,7 @@ class DeepgramLiveRelayConnection
         if (is_array($utterances) && count($utterances) > 0) {
             $uOut = [];
             foreach ($utterances as $u) {
-                if (!is_array($u)) {
+                if (! is_array($u)) {
                     continue;
                 }
                 $t = trim((string) ($u['text'] ?? $u['transcript'] ?? ''));
@@ -2625,7 +2820,7 @@ class DeepgramLiveRelayConnection
         if (is_array($words) && count($words) > 0) {
             $wOut = [];
             foreach ($words as $w) {
-                if (!is_array($w)) {
+                if (! is_array($w)) {
                     continue;
                 }
                 $txt = trim((string) ($w['word'] ?? ''));
@@ -2648,7 +2843,7 @@ class DeepgramLiveRelayConnection
     private function onPulseMessage(int $meetingId, string $json): void
     {
         $p = json_decode($json, true);
-        if (!is_array($p)) {
+        if (! is_array($p)) {
             return;
         }
         if (isset($p['error'])) {
@@ -2663,7 +2858,7 @@ class DeepgramLiveRelayConnection
         $hasWords = is_array($p['words'] ?? null) && count($p['words']) > 0;
         $hasUtterances = is_array($p['utterances'] ?? null) && count($p['utterances']) > 0;
         $hasTranscript = trim((string) ($p['transcript'] ?? '')) !== '';
-        if (!$hasWords && !$hasUtterances && !$hasTranscript) {
+        if (! $hasWords && ! $hasUtterances && ! $hasTranscript) {
             return;
         }
 
@@ -2682,7 +2877,7 @@ class DeepgramLiveRelayConnection
     private function onDeepgramMessage(int $meetingId, string $json): void
     {
         $data = json_decode($json, true);
-        if (!is_array($data)) {
+        if (! is_array($data)) {
             return;
         }
 
@@ -2709,7 +2904,7 @@ class DeepgramLiveRelayConnection
 
         if ($hasUtterances) {
             foreach ($utterances as $u) {
-                if (!is_array($u)) {
+                if (! is_array($u)) {
                     continue;
                 }
                 $speaker = $u['speaker'] ?? null;
@@ -2719,7 +2914,7 @@ class DeepgramLiveRelayConnection
                     continue;
                 }
 
-                $label = $speaker === null ? 'speaker_unknown' : ('speaker_' . (int) $speaker);
+                $label = $speaker === null ? 'speaker_unknown' : ('speaker_'.(int) $speaker);
                 $t = (string) ($u['transcript'] ?? '');
                 // Only treat as active speech for realtime PCM fill / reconcile when there is
                 // actual text; empty diarization segments would otherwise pin "recent speech"
@@ -2728,7 +2923,7 @@ class DeepgramLiveRelayConnection
                     $t2 = trim($t);
                     $this->activeSpeakerLabel = (string) $label;
                     $this->lastActiveSpeakerAt = (float) $now;
-                    if (!$isFinalChunk) {
+                    if (! $isFinalChunk) {
                         // Keep interim text live, but skip heavy numeric aggregation until final.
                         $this->livePartialByLabel[$label] = $t2;
                     } else {
@@ -2738,10 +2933,10 @@ class DeepgramLiveRelayConnection
                         $this->totalSeconds = max($this->totalSeconds, $end);
                         $this->recentSpeakerIntervals[] = ['label' => $label, 'start' => $start, 'end' => $end];
 
-                        $segKey = $label . '|' . number_format($start, 2, '.', '') . '|' . number_format($end, 2, '.', '') . '|' . md5($t2);
-                        if (!isset($this->seenTranscriptSegments[$segKey])) {
+                        $segKey = $label.'|'.number_format($start, 2, '.', '').'|'.number_format($end, 2, '.', '').'|'.md5($t2);
+                        if (! isset($this->seenTranscriptSegments[$segKey])) {
                             $this->seenTranscriptSegments[$segKey] = $now;
-                            $speakerText[$label] = ($speakerText[$label] ?? '') . ' ' . $t2;
+                            $speakerText[$label] = ($speakerText[$label] ?? '').' '.$t2;
                         }
                     }
 
@@ -2765,14 +2960,14 @@ class DeepgramLiveRelayConnection
             $channelTranscript = $this->channelLevelTranscript($data);
             $preferChannelText = $channelTranscript !== '';
 
-            if (!is_array($words)) {
+            if (! is_array($words)) {
                 $words = null;
             }
 
             // Channel-level transcript can arrive with words=[] during interim streaming.
             $this->applyChannelTranscriptFallback($data, $words, $hasUtterances, $now, $speakerText);
 
-            if (!is_array($words) || count($words) === 0) {
+            if (! is_array($words) || count($words) === 0) {
                 // Nothing else to attribute at word granularity.
                 if (count($intervals) === 0 && count($speakerText) === 0) {
                     // Still might have refreshed livePartialByLabel for interim UI.
@@ -2783,25 +2978,25 @@ class DeepgramLiveRelayConnection
                             break;
                         }
                     }
-                    if (!$hasAnyPartial) {
+                    if (! $hasAnyPartial) {
                         return;
                     }
                 }
             } else {
                 // Word-level path owns the transcript; drop any channel interim buffer.
                 foreach ($words as $w) {
-                    if (!is_array($w)) {
+                    if (! is_array($w)) {
                         continue;
                     }
-                    if (!array_key_exists('speaker', $w) || $w['speaker'] === null || $w['speaker'] === '') {
+                    if (! array_key_exists('speaker', $w) || $w['speaker'] === null || $w['speaker'] === '') {
                         continue;
                     }
-                    $lab = 'speaker_' . (int) $w['speaker'];
+                    $lab = 'speaker_'.(int) $w['speaker'];
                     unset($this->livePartialByLabel[$lab]);
                 }
 
                 foreach ($words as $w) {
-                    if (!is_array($w)) {
+                    if (! is_array($w)) {
                         continue;
                     }
                     $speaker = $w['speaker'] ?? null;
@@ -2811,7 +3006,7 @@ class DeepgramLiveRelayConnection
                         continue;
                     }
 
-                    $label = $speaker === null ? 'speaker_unknown' : ('speaker_' . (int) $speaker);
+                    $label = $speaker === null ? 'speaker_unknown' : ('speaker_'.(int) $speaker);
                     $wordTxt = trim((string) ($w['punctuated_word'] ?? ($w['word'] ?? '')));
                     if ($wordTxt !== '') {
                         $this->pushSttDebugWord([
@@ -2834,7 +3029,7 @@ class DeepgramLiveRelayConnection
 
                     // Word-level interim: only refresh "recent speech" when a real token arrived,
                     // otherwise silence frames keep lastActiveSpeakerAt hot and realtime fill runs away.
-                    if (!$isFinalChunk) {
+                    if (! $isFinalChunk) {
                         $this->activeSpeakerLabel = (string) $label;
                         $wordForActivity = $wordTxt;
                         if ($wordForActivity !== '') {
@@ -2842,15 +3037,15 @@ class DeepgramLiveRelayConnection
                         }
                     }
 
-                    if ($isFinalChunk && !$preferChannelText) {
+                    if ($isFinalChunk && ! $preferChannelText) {
                         $word = (string) $wordTxt;
                         if ($word !== '') {
                             // Word-level streams can repeat heavily; dedupe in small windows.
                             $word2 = trim($word);
-                            $segKey = $label . '|' . number_format($start, 2, '.', '') . '|' . number_format($end, 2, '.', '') . '|' . md5($word2);
-                            if (!isset($this->seenTranscriptSegments[$segKey])) {
+                            $segKey = $label.'|'.number_format($start, 2, '.', '').'|'.number_format($end, 2, '.', '').'|'.md5($word2);
+                            if (! isset($this->seenTranscriptSegments[$segKey])) {
                                 $this->seenTranscriptSegments[$segKey] = $now;
-                                $speakerText[$label] = ($speakerText[$label] ?? '') . ' ' . $word2;
+                                $speakerText[$label] = ($speakerText[$label] ?? '').' '.$word2;
                             }
                         }
                     }
@@ -2861,30 +3056,30 @@ class DeepgramLiveRelayConnection
                 if ($preferChannelText) {
                     $labelForTranscript = null;
                     foreach ($words as $w) {
-                        if (!is_array($w)) {
+                        if (! is_array($w)) {
                             continue;
                         }
-                        if (!array_key_exists('speaker', $w) || $w['speaker'] === null || $w['speaker'] === '') {
+                        if (! array_key_exists('speaker', $w) || $w['speaker'] === null || $w['speaker'] === '') {
                             continue;
                         }
-                        $labelForTranscript = 'speaker_' . (int) $w['speaker'];
+                        $labelForTranscript = 'speaker_'.(int) $w['speaker'];
                         break;
                     }
                     if ($labelForTranscript === null) {
                         $labelForTranscript = $this->guessSpeakerLabelFromRecentIntervals();
                     }
 
-                    if (!$isFinalChunk) {
+                    if (! $isFinalChunk) {
                         $this->livePartialByLabel[$labelForTranscript] = $channelTranscript;
                     } else {
                         $partial = trim((string) ($this->livePartialByLabel[$labelForTranscript] ?? ''));
                         unset($this->livePartialByLabel[$labelForTranscript]);
-                        $chunk = trim($partial === '' ? $channelTranscript : ($partial . ' ' . $channelTranscript));
+                        $chunk = trim($partial === '' ? $channelTranscript : ($partial.' '.$channelTranscript));
                         if ($chunk !== '') {
-                            $segKey = $labelForTranscript . '|channel_words_final|' . md5($chunk);
-                            if (!isset($this->seenTranscriptSegments[$segKey])) {
+                            $segKey = $labelForTranscript.'|channel_words_final|'.md5($chunk);
+                            if (! isset($this->seenTranscriptSegments[$segKey])) {
                                 $this->seenTranscriptSegments[$segKey] = $now;
-                                $speakerText[$labelForTranscript] = ($speakerText[$labelForTranscript] ?? '') . ' ' . $chunk;
+                                $speakerText[$labelForTranscript] = ($speakerText[$labelForTranscript] ?? '').' '.$chunk;
                             }
                         }
                     }
@@ -2917,7 +3112,7 @@ class DeepgramLiveRelayConnection
                 }
                 // Only accept names that match an enrolled participant.
                 $enrolledId = $this->enrolledParticipants[strtolower($name)] ?? null;
-                if (!$enrolledId) {
+                if (! $enrolledId) {
                     continue;
                 }
 
@@ -2999,11 +3194,16 @@ class DeepgramLiveRelayConnection
         $overlap = 0.0;
         foreach ($events as [$t, $d]) {
             if ($last !== null && $active >= 2) {
-                $overlap += max(0.0, $t - $last);
+                $delta = max(0.0, $t - $last);
+                $minOverlap = MeetingLiveTuning::float('live.overlap_min_seconds', 0.12);
+                if ($delta >= $minOverlap) {
+                    $overlap += $delta;
+                }
             }
             $active += $d;
             $last = $t;
         }
+
         return $overlap;
     }
 
@@ -3036,10 +3236,10 @@ class DeepgramLiveRelayConnection
                     ->where('speaker_label', $label)
                     ->first();
 
-                if (!$mapping) {
+                if (! $mapping) {
                     $display = $label;
                     if (preg_match('/^speaker_(\\d+)$/', $label, $m)) {
-                        $display = 'Speaker ' . $m[1];
+                        $display = 'Speaker '.$m[1];
                     }
                     $participant = MeetingParticipant::create([
                         'meeting_id' => $meetingId,
@@ -3068,14 +3268,14 @@ class DeepgramLiveRelayConnection
             // When diarization collapses (everything is speaker_0), redirecting SpeakerMapping is harmful:
             // it becomes "sticky" and all subsequent speech is attributed to the first matched participant.
             // In that mode we must rely on rolling fallback attribution (fallbackParticipantSeconds) only.
-            if (!$diarizationCollapsed) {
+            if (! $diarizationCollapsed) {
                 // Voice recognition: if we can match a label to an enrolled participant, redirect the mapping
                 // and delete the placeholder participant (so UI stops showing speaker_0/speaker_1).
                 foreach (array_keys($this->speakerSeconds) as $label) {
                     $label = (string) $label;
                     // Fast-path for the common single-user meeting:
                     // bind label in ~2-3s instead of waiting for many embeddings.
-                    if (!isset($this->autoBoundLabels[$label]) && count($this->enrolledVoiceprints) === 1) {
+                    if (! isset($this->autoBoundLabels[$label]) && count($this->enrolledVoiceprints) === 1) {
                         $sec = max(0.0, (float) ($this->speakerSeconds[$label] ?? 0.0));
                         if ($sec >= 2.0) {
                             $onlyPid = (int) ($this->enrolledVoiceprints[0]['participant_id'] ?? 0);
@@ -3098,12 +3298,13 @@ class DeepgramLiveRelayConnection
                                     'threshold' => 0.0,
                                     'matched' => true,
                                 ];
+
                                 continue;
                             }
                         }
                     }
                     $candidate = $this->getVoiceprintForLabel($label);
-                    if (!$candidate) {
+                    if (! $candidate) {
                         $this->lastVoiceMatching[$label] = [
                             'evidence_count' => 0,
                             'best_participant_id' => null,
@@ -3119,6 +3320,7 @@ class DeepgramLiveRelayConnection
                             'window_seconds' => $this->labelWindowSeconds,
                             'min_speech_seconds' => $this->labelMinSpeechSeconds,
                         ]);
+
                         continue;
                     }
                     $vec = $candidate['vec'];
@@ -3144,7 +3346,7 @@ class DeepgramLiveRelayConnection
                         $ema[$pid] = ($alpha * (float) $p) + ((1.0 - $alpha) * $prev);
                     }
                     foreach ($ema as $pid => $p) {
-                        if (!array_key_exists((int) $pid, $posterior)) {
+                        if (! array_key_exists((int) $pid, $posterior)) {
                             $ema[(int) $pid] = (float) ($p * (1.0 - ($alpha * 0.20)));
                         }
                     }
@@ -3219,14 +3421,14 @@ class DeepgramLiveRelayConnection
                         'speech_seconds' => $speechSeconds,
                     ]);
 
-                    if (!$matched) {
+                    if (! $matched) {
                         continue;
                     }
                     $matchedParticipantId = (int) $stablePid;
                     $score = (float) $emaTopP;
 
                     $currentPid = $labelToParticipantId[$label] ?? null;
-                    if (!$currentPid) {
+                    if (! $currentPid) {
                         continue;
                     }
                     $matchedParticipantId = (int) $matchedParticipantId;
@@ -3237,6 +3439,7 @@ class DeepgramLiveRelayConnection
                             ->where('meeting_id', $meetingId)
                             ->where('speaker_label', $label)
                             ->update(['confidence' => (float) $score]);
+
                         continue;
                     }
 
@@ -3304,23 +3507,23 @@ class DeepgramLiveRelayConnection
             // Apply detected name to each WS speaker label (intro only; avoid sticky relabeling in collapsed mode).
             // If the same name was enrolled via HTTP intro, merge by redirecting
             // the SpeakerMapping to the enrolled participant (no duplicate rows).
-            if (!$diarizationCollapsed) {
+            if (! $diarizationCollapsed) {
                 foreach ($this->speakerDetectedName as $label => $detection) {
                     $pid = $labelToParticipantId[$label] ?? null;
-                    if (!$pid) {
+                    if (! $pid) {
                         continue;
                     }
 
-                    $realName    = $detection['name'];
+                    $realName = $detection['name'];
                     $participant = MeetingParticipant::query()->whereKey($pid)->first();
-                    if (!$participant) {
+                    if (! $participant) {
                         continue;
                     }
 
                     $isPlaceholder = preg_match('/^Speaker\s+\d+$/i', (string) $participant->name) === 1
                         || preg_match('/^speaker_\d+$/i', (string) $participant->name) === 1;
 
-                    if (!$isPlaceholder) {
+                    if (! $isPlaceholder) {
                         continue;
                     }
 
@@ -3362,7 +3565,7 @@ class DeepgramLiveRelayConnection
 
             foreach ($this->speakerSeconds as $label => $sec) {
                 $pid = $labelToParticipantId[$label] ?? null;
-                if (!$pid) {
+                if (! $pid) {
                     continue;
                 }
                 $talkTime = (int) round($sec);
@@ -3416,7 +3619,7 @@ class DeepgramLiveRelayConnection
         }
         $cur = max(0.0, (float) $this->audioCursorSeconds);
 
-        if (!$this->talkClockBaselineReady) {
+        if (! $this->talkClockBaselineReady) {
             $this->lastTalkClockSpeechSum = $sum;
             $this->lastTalkClockAudioCursor = $cur;
             $this->talkClockBaselineReady = true;
@@ -3439,7 +3642,7 @@ class DeepgramLiveRelayConnection
         if ($orphan > 0.04 && $orphan <= 3.0 && count($this->speakerSeconds) > 0 && $recentSpeech) {
             $last = $this->recentSpeakerIntervals[count($this->recentSpeakerIntervals) - 1] ?? null;
             $lastLabel = is_array($last) ? (string) ($last['label'] ?? '') : '';
-            if ($lastLabel === '' || !array_key_exists($lastLabel, $this->speakerSeconds)) {
+            if ($lastLabel === '' || ! array_key_exists($lastLabel, $this->speakerSeconds)) {
                 $lastLabel = (string) array_key_first($this->speakerSeconds);
             }
             $this->speakerSeconds[$lastLabel] = ($this->speakerSeconds[$lastLabel] ?? 0.0) + $orphan;
@@ -3579,16 +3782,11 @@ class DeepgramLiveRelayConnection
                 'participants' => $stats,
                 'crosstalk_percentage' => (float) $this->computeLiveCrosstalkPercentage(),
                 'live_audio_seconds' => (float) $this->audioCursorSeconds,
-                'voice_config' => [
-                    'format' => $this->audioFormat,
-                    'threshold' => (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75)),
-                    'early_boost' => (float) (env('MEETING_VOICEPRINT_EARLY_BOOST', 0.07)),
-                    'label_window_seconds' => (float) $this->labelWindowSeconds,
-                    'label_min_speech_seconds' => (float) $this->labelMinSpeechSeconds,
-                ],
+                'voice_config' => $this->relayVoiceConfigForClient(),
                 'voice_matching' => array_merge($this->lastVoiceMatching, [
                     '_fallback_last' => $this->lastFallbackMatching,
                 ]),
+                'relay_debug' => $this->relayDebugForClient(),
                 'updated_at' => null,
             ];
             if ($this->voiceDebug) {
@@ -3601,6 +3799,7 @@ class DeepgramLiveRelayConnection
                     'last_stt_words_updated_at' => $this->lastSttWordsUpdatedAt,
                 ];
             }
+
             return $payload;
         }
 
@@ -3664,16 +3863,11 @@ class DeepgramLiveRelayConnection
             'participants' => $stats,
             'crosstalk_percentage' => $crosstalk,
             'live_audio_seconds' => (float) $this->audioCursorSeconds,
-            'voice_config' => [
-                'format' => $this->audioFormat,
-                'threshold' => (float) (env('MEETING_VOICEPRINT_THRESHOLD', 0.75)),
-                'early_boost' => (float) (env('MEETING_VOICEPRINT_EARLY_BOOST', 0.07)),
-                'label_window_seconds' => (float) $this->labelWindowSeconds,
-                'label_min_speech_seconds' => (float) $this->labelMinSpeechSeconds,
-            ],
+            'voice_config' => $this->relayVoiceConfigForClient(),
             'voice_matching' => array_merge($this->lastVoiceMatching, [
                 '_fallback_last' => $this->lastFallbackMatching,
             ]),
+            'relay_debug' => $this->relayDebugForClient(),
             'updated_at' => $analytic?->updated_at?->toISOString(),
         ];
         if ($this->voiceDebug) {
@@ -3686,12 +3880,13 @@ class DeepgramLiveRelayConnection
                 'last_stt_words_updated_at' => $this->lastSttWordsUpdatedAt,
             ];
         }
+
         return $payload;
     }
 
     private function pushSttDebugWord(array $item): void
     {
-        if (!$this->voiceDebug) {
+        if (! $this->voiceDebug) {
             return;
         }
         $this->lastSttWords[] = $item;
@@ -3699,5 +3894,202 @@ class DeepgramLiveRelayConnection
             $this->lastSttWords = array_slice($this->lastSttWords, -120);
         }
         $this->lastSttWordsUpdatedAt = microtime(true);
+    }
+
+    /**
+     * Early voiceprint bind (~1–2s) so UI shows enrolled names instead of speaker_0.
+     */
+    private function maybeFastIdentifyEnrolledLabels(int $meetingId): void
+    {
+        if (! MeetingLiveTuning::bool('live.fast_identify', true)) {
+            return;
+        }
+        if (count($this->enrolledVoiceprints) < 1 || $this->voiceEmbeddingBusy || $this->fastIdentifyBusy) {
+            return;
+        }
+        if (count($this->audioChunks) === 0) {
+            return;
+        }
+
+        $afterSec = MeetingLiveTuning::float('live.fast_identify_after_seconds', 1.5);
+        $minScore = MeetingLiveTuning::float('live.fast_identify_min_score', 0.68);
+        $minMargin = MeetingLiveTuning::float('live.fast_identify_min_margin', 0.02);
+        $window = MeetingLiveTuning::float('live.fast_identify_window_seconds', 1.2);
+        $window = max(0.6, min(4.0, $window));
+
+        $labels = array_values(array_unique(array_merge(
+            array_keys($this->livePartialByLabel),
+            array_keys($this->speakerSeconds),
+        )));
+
+        foreach ($labels as $label) {
+            $label = (string) $label;
+            if ($label === '' || isset($this->autoBoundLabels[$label])) {
+                continue;
+            }
+
+            $hasPartial = trim((string) ($this->livePartialByLabel[$label] ?? '')) !== '';
+            $speechSec = (float) ($this->speakerSeconds[$label] ?? 0.0);
+            if ($speechSec < $afterSec && ! $hasPartial) {
+                continue;
+            }
+
+            $rangeEnd = max($this->audioCursorSeconds, $this->totalSeconds);
+            $rangeStart = max(0.0, $rangeEnd - $window);
+
+            $this->fastIdentifyBusy = true;
+            $this->voiceEmbeddingBusy = true;
+            async(function () use ($meetingId, $label, $rangeStart, $rangeEnd, $minScore, $minMargin): void {
+                try {
+                    $vec = $this->computeEmbeddingForRange($meetingId, $rangeStart, $rangeEnd);
+                    if (! is_array($vec) || count($vec) < 32) {
+                        return;
+                    }
+                    $match = $this->matchVoiceprintAtThreshold($vec, $minScore, $minMargin, 1);
+                    if ($match === null) {
+                        return;
+                    }
+                    [$pid, $score] = $match;
+                    $this->applyLiveLabelBinding($meetingId, $label, $pid, $score);
+                    $this->autoBoundLabels[$label] = true;
+                } finally {
+                    $this->voiceEmbeddingBusy = false;
+                    $this->fastIdentifyBusy = false;
+                }
+            });
+
+            return;
+        }
+    }
+
+    /**
+     * @return array{0:int,1:float}|null
+     */
+    private function matchVoiceprintAtThreshold(array $vec, float $threshold, float $minMargin, int $evidenceCount = 1): ?array
+    {
+        if (count($this->enrolledVoiceprints) === 0) {
+            return null;
+        }
+        if ($evidenceCount < 2) {
+            $threshold += MeetingLiveTuning::float('voiceprint.early_boost', 0.05) * 0.5;
+        }
+        $bestByPid = [];
+        foreach ($this->enrolledVoiceprints as $e) {
+            $pid = (int) $e['participant_id'];
+            if ($pid <= 0) {
+                continue;
+            }
+            $score = $this->cosineSimilarity($vec, $e['vector']);
+            if (! isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+                $bestByPid[$pid] = (float) $score;
+            }
+        }
+        arsort($bestByPid);
+        $bestId = count($bestByPid) ? (int) array_key_first($bestByPid) : null;
+        $bestScore = $bestId ? (float) ($bestByPid[$bestId] ?? -1.0) : -1.0;
+        $vals = array_values($bestByPid);
+        $secondBest = count($vals) >= 2 ? (float) $vals[1] : -1.0;
+        if ($bestId === null || $bestScore < $threshold) {
+            return null;
+        }
+        if (($bestScore - max(-1.0, $secondBest)) < $minMargin) {
+            return null;
+        }
+
+        return [$bestId, $bestScore];
+    }
+
+    private function applyLiveLabelBinding(int $meetingId, string $label, int $participantId, float $score): void
+    {
+        if ($participantId <= 0 || $label === '') {
+            return;
+        }
+
+        $mapping = SpeakerMapping::query()
+            ->where('meeting_id', $meetingId)
+            ->where('speaker_label', $label)
+            ->first();
+
+        if (! $mapping) {
+            $participant = MeetingParticipant::query()->whereKey($participantId)->first();
+            $mapping = SpeakerMapping::create([
+                'meeting_id' => $meetingId,
+                'speaker_label' => $label,
+                'participant_id' => $participantId,
+                'confidence' => $score,
+            ]);
+            if (! $participant) {
+                return;
+            }
+        } else {
+            $currentPid = (int) $mapping->participant_id;
+            if ($currentPid !== $participantId) {
+                $placeholder = MeetingParticipant::query()->whereKey($currentPid)->first();
+                $isPlaceholder = $placeholder && (
+                    preg_match('/^Speaker\s+\d+$/i', (string) $placeholder->name) === 1
+                    || preg_match('/^speaker_\d+$/i', (string) $placeholder->name) === 1
+                );
+                if ($isPlaceholder) {
+                    $placeholder->delete();
+                }
+            }
+            $mapping->update([
+                'participant_id' => $participantId,
+                'confidence' => $score,
+            ]);
+        }
+
+        $name = (string) (MeetingParticipant::query()->whereKey($participantId)->value('name') ?? '');
+        $this->speakerLabelToParticipantIdCache[$label] = $participantId;
+        $this->speakerLabelToNameCache[$label] = $name !== '' ? $name : $label;
+        $this->lastVoiceMatching[$label] = [
+            'evidence_count' => 1,
+            'best_participant_id' => $participantId,
+            'best_participant_name' => $name,
+            'best_score' => $score,
+            'threshold' => MeetingLiveTuning::float('live.fast_identify_min_score', 0.68),
+            'matched' => true,
+            'fast_identify' => true,
+        ];
+        $this->refreshSpeakerMappingCache($meetingId, [$label]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function relayVoiceConfigForClient(): array
+    {
+        return [
+            'format' => $this->audioFormat,
+            'threshold' => MeetingLiveTuning::float('voiceprint.threshold', 0.78),
+            'early_boost' => MeetingLiveTuning::float('voiceprint.early_boost', 0.05),
+            'label_window_seconds' => (float) $this->labelWindowSeconds,
+            'label_min_speech_seconds' => (float) $this->labelMinSpeechSeconds,
+            'tuning' => [
+                'endpointing_ms' => MeetingLiveTuning::int('live.endpointing_ms', 100),
+                'utterance_end_ms' => MeetingLiveTuning::int('live.utterance_end_ms', 900),
+                'fast_identify' => MeetingLiveTuning::bool('live.fast_identify', true),
+                'fast_identify_after_seconds' => MeetingLiveTuning::float('live.fast_identify_after_seconds', 1.5),
+                'fast_identify_min_score' => MeetingLiveTuning::float('live.fast_identify_min_score', 0.68),
+                'fast_identify_min_margin' => MeetingLiveTuning::float('live.fast_identify_min_margin', 0.02),
+                'overlap_min_seconds' => MeetingLiveTuning::float('live.overlap_min_seconds', 0.12),
+                'voiceprint_margin' => MeetingLiveTuning::float('voiceprint.margin', 0.06),
+                'voiceprint_margin_2p' => MeetingLiveTuning::float('voiceprint.margin_2p', 0.012),
+            ],
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function relayDebugForClient(): array
+    {
+        return [
+            'diarization_collapsed' => count($this->enrolledVoiceprints) >= 2 && $this->concreteDiarizedLabelCount() <= 1,
+            'diarized_label_count' => $this->concreteDiarizedLabelCount(),
+            'enrolled_voiceprints' => count($this->enrolledVoiceprints),
+            'auto_bound_labels' => array_keys($this->autoBoundLabels),
+            'active_speaker_label' => (string) $this->activeSpeakerLabel,
+        ];
     }
 }

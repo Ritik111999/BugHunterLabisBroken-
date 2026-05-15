@@ -3,7 +3,10 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Jobs\IndexMeetingSearchJob;
+use App\Jobs\SummarizeMeetingJob;
 use App\Models\Meeting;
+use App\Support\LiveTranscriptWriter;
 use App\Models\MeetingParticipant;
 use Illuminate\Http\Request;
 
@@ -41,12 +44,13 @@ class MeetingController extends Controller
     {
         return (bool) preg_match('/^(Speaker\s+\d+|speaker_\d+|speaker_unknown|chunk\d+_\S+)$/i', trim($name));
     }
+
     public function create(Request $request)
     {
         $meeting = Meeting::create([
             'host_id' => auth()->id(),
             'title' => $request->title,
-            'status' => 'pending'
+            'status' => 'pending',
         ]);
 
         return response()->json($meeting);
@@ -72,19 +76,10 @@ class MeetingController extends Controller
             $missing = [];
             foreach ($participants as $p) {
                 $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
-                $vp = $ve['voiceprint'] ?? null;
-                if (!is_array($vp) || count($vp) < 32) {
+                $vec = $this->normalizedVoiceprintVectorFromEmbedding($ve);
+                if ($vec === null) {
                     $missing[] = ['participant_id' => (int) $p->id, 'name' => (string) ($p->name ?? '')];
-                    continue;
-                }
-                $vec = [];
-                foreach ($vp as $v) {
-                    if (is_numeric($v)) {
-                        $vec[] = (float) $v;
-                    }
-                }
-                if (count($vec) < 32) {
-                    $missing[] = ['participant_id' => (int) $p->id, 'name' => (string) ($p->name ?? '')];
+
                     continue;
                 }
                 $vectors[] = ['id' => (int) $p->id, 'name' => (string) ($p->name ?? ''), 'vec' => $vec];
@@ -98,20 +93,23 @@ class MeetingController extends Controller
                 ], 422);
             }
 
-            $dupThr = (float) env('MEETING_START_DUPLICATE_VOICEPRINT_SIM', 0.985);
-            $dupThr = max(0.85, min(0.999, $dupThr));
-            for ($i = 0; $i < count($vectors); $i++) {
-                for ($j = $i + 1; $j < count($vectors); $j++) {
-                    $sim = $this->cosineSimilarity($vectors[$i]['vec'], $vectors[$j]['vec']);
-                    if ($sim >= $dupThr) {
-                        return response()->json([
-                            'message' => 'Two participants have near-identical voiceprints. Re-enroll to avoid wrong attribution.',
-                            'code' => 'voiceprints_too_similar',
-                            'similarity' => $sim,
-                            'threshold' => $dupThr,
-                            'a' => ['participant_id' => $vectors[$i]['id'], 'name' => $vectors[$i]['name']],
-                            'b' => ['participant_id' => $vectors[$j]['id'], 'name' => $vectors[$j]['name']],
-                        ], 422);
+            $skipDup = filter_var(config('meeting_voice.start.relax_duplicate_check', false), FILTER_VALIDATE_BOOL);
+            if (! $skipDup) {
+                $dupThr = (float) config('meeting_voice.start.duplicate_voiceprint_sim', 0.972);
+                $dupThr = max(0.85, min(0.999, $dupThr));
+                for ($i = 0; $i < count($vectors); $i++) {
+                    for ($j = $i + 1; $j < count($vectors); $j++) {
+                        $sim = $this->cosineSimilarity($vectors[$i]['vec'], $vectors[$j]['vec']);
+                        if ($sim >= $dupThr) {
+                            return response()->json([
+                                'message' => 'Two participants have near-identical voiceprints. Re-enroll to avoid wrong attribution.',
+                                'code' => 'voiceprints_too_similar',
+                                'similarity' => $sim,
+                                'threshold' => $dupThr,
+                                'a' => ['participant_id' => $vectors[$i]['id'], 'name' => $vectors[$i]['name']],
+                                'b' => ['participant_id' => $vectors[$j]['id'], 'name' => $vectors[$j]['name']],
+                            ], 422);
+                        }
                     }
                 }
             }
@@ -119,10 +117,47 @@ class MeetingController extends Controller
 
         $meeting->update([
             'started_at' => now(),
-            'status' => 'processing'
+            'status' => 'processing',
         ]);
 
         return response()->json(['message' => 'Meeting started']);
+    }
+
+    /**
+     * Prefer primary voiceprint; fall back to any template in voiceprints[] (intro pipeline may only populate list).
+     *
+     * @param  array<string, mixed>  $ve
+     * @return array<int, float>|null
+     */
+    private function normalizedVoiceprintVectorFromEmbedding(array $ve): ?array
+    {
+        $candidates = [];
+        $vp = $ve['voiceprint'] ?? null;
+        if (is_array($vp)) {
+            $candidates[] = $vp;
+        }
+        $list = $ve['voiceprints'] ?? null;
+        if (is_array($list)) {
+            foreach ($list as $row) {
+                if (is_array($row)) {
+                    $candidates[] = $row;
+                }
+            }
+        }
+
+        foreach ($candidates as $arr) {
+            $vec = [];
+            foreach ($arr as $v) {
+                if (is_numeric($v)) {
+                    $vec[] = (float) $v;
+                }
+            }
+            if (count($vec) >= 32) {
+                return $vec;
+            }
+        }
+
+        return null;
     }
 
     /** @param array<int,float> $a @param array<int,float> $b */
@@ -143,6 +178,7 @@ class MeetingController extends Controller
             $nb += $y * $y;
         }
         $den = sqrt(max(1e-12, $na)) * sqrt(max(1e-12, $nb));
+
         return $den > 0 ? ($dot / $den) : 0.0;
     }
 
@@ -170,46 +206,52 @@ class MeetingController extends Controller
             'duration' => $durationSeconds,
         ]);
 
+        LiveTranscriptWriter::clearMeetingCache((int) $meeting->id);
+        SummarizeMeetingJob::dispatch((int) $meeting->id)->onQueue('default');
+        IndexMeetingSearchJob::dispatch((int) $meeting->id)->onQueue('default');
+
         return response()->json(['message' => 'Meeting ended']);
     }
+
     public function delete($id)
-{
-    $meeting = Meeting::where('id', $id)
-        ->where('host_id', auth()->id())
-        ->first();
+    {
+        $meeting = Meeting::where('id', $id)
+            ->where('host_id', auth()->id())
+            ->first();
 
-    if (!$meeting) {
+        if (! $meeting) {
+            return response()->json([
+                'message' => 'Meeting not found or unauthorized',
+            ], 404);
+        }
+
+        $meeting->delete();
+
         return response()->json([
-            'message' => 'Meeting not found or unauthorized'
-        ], 404);
+            'message' => 'Meeting deleted successfully',
+        ]);
     }
 
-    $meeting->delete();
+    public function show($id)
+    {
+        $meeting = Meeting::with([
+            'participants.stats',
+            'participants.mappings',
+        ])
+            ->where('id', $id)
+            ->where('host_id', auth()->id())
+            ->first();
 
-    return response()->json([
-        'message' => 'Meeting deleted successfully'
-    ]);
-}
-public function show($id)
-{
-    $meeting = Meeting::with([
-        'participants.stats',
-        'participants.mappings'
-    ])
-    ->where('id', $id)
-    ->where('host_id', auth()->id())
-    ->first();
+        if (! $meeting) {
+            return response()->json([
+                'message' => 'Meeting not found or unauthorized',
+            ], 404);
+        }
 
-    if (!$meeting) {
         return response()->json([
-            'message' => 'Meeting not found or unauthorized'
-        ], 404);
+            'meeting' => $meeting,
+            'participants' => $meeting->participants,
+            'analytics' => $meeting->participants->pluck('stats'),
+        ]);
     }
-
-    return response()->json([
-        'meeting' => $meeting,
-        'participants' => $meeting->participants,
-        'analytics' => $meeting->participants->pluck('stats')
-    ]);
-}
 }

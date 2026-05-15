@@ -37,5 +37,10 @@ return [
         })(),
         'timeout_seconds' => (int) env('MEETING_ANALYZER_TIMEOUT', 60),
     ],
+
+    // Post-meeting LLM summary (optional — SummarizeMeetingJob)
+    'openai_api_key' => env('OPENAI_API_KEY', ''),
+    'openai_model' => env('OPENAI_MODEL', 'gpt-4o-mini'),
+    'openai_embedding_model' => env('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
 ];
 

@@ -99,8 +99,10 @@ class MeetingController extends Controller
         ])));
 
         foreach ($candidates as $candidate) {
-            if (Storage::disk('local')->exists($candidate)) {
-                return Storage::disk('local')->download($candidate);
+            foreach (['meeting_audio', 'local', 's3'] as $diskName) {
+                if (Storage::disk($diskName)->exists($candidate)) {
+                    return Storage::disk($diskName)->download($candidate);
+                }
             }
         }
 

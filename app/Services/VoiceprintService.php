@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Support\MlPythonEnv;
 use Symfony\Component\Process\Process;
 
 class VoiceprintService
@@ -11,11 +12,17 @@ class VoiceprintService
      *
      * @return array{embedding: array<int,float>, engine: string}|null
      */
-    public function computeEcapa(string $absolutePath, ?float $maxSeconds = null): ?array
+    public function computeEcapa(string $absolutePath, ?float $maxSeconds = null, ?string $audioInputProfile = null): ?array
     {
         $python = (string) config('meeting_analytics.analyzer.python', 'python3');
         $script = base_path('scripts/embed_audio.py');
         $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
+
+        $profile = $audioInputProfile;
+        if ($profile === null || trim((string) $profile) === '') {
+            $profile = (string) config('meeting_voice.input_profile', 'default');
+        }
+        $profile = strtolower(trim((string) $profile));
 
         $process = new Process([
             $python,
@@ -28,17 +35,18 @@ class VoiceprintService
             (string) ($maxSeconds ?? 0),
         ]);
         $process->setTimeout($timeout + 20);
-        $process->setEnv(array_merge($_SERVER, $_ENV, [
+        $process->setEnv(array_merge($_SERVER, $_ENV, MlPythonEnv::forSubprocess(), [
+            'MEETING_AUDIO_INPUT_PROFILE' => $profile,
             'PATH' => $this->buildPath(),
         ]));
         $process->run();
 
-        if (!$process->isSuccessful()) {
+        if (! $process->isSuccessful()) {
             return null;
         }
 
         $decoded = json_decode((string) $process->getOutput(), true);
-        if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
+        if (! is_array($decoded) || ! is_array($decoded['embedding'] ?? null)) {
             return null;
         }
 
@@ -75,7 +83,7 @@ class VoiceprintService
 
         $detected = null;
         foreach ($candidates as $dir) {
-            if (is_executable($dir . '/ffprobe')) {
+            if (is_executable($dir.'/ffprobe')) {
                 $detected = $dir;
                 break;
             }
@@ -90,4 +98,3 @@ class VoiceprintService
         return implode(':', $parts);
     }
 }
-

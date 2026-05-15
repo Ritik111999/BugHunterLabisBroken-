@@ -130,4 +130,13 @@ return [
     */
     'support_email' => env('SUPPORT_EMAIL'),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Authenticated JSON API throttle (requests / minute / user)
+    |--------------------------------------------------------------------------
+    | Clamped in AppServiceProvider to avoid accidental misconfiguration.
+    | Override with API_AUTH_REQUESTS_PER_MINUTE in .env when needed.
+    */
+    'api_auth_requests_per_minute' => (int) env('API_AUTH_REQUESTS_PER_MINUTE', 900),
+
 ];

@@ -14,7 +14,8 @@
         "amphp/websocket-server": "^4.0",
         "laravel/framework": "^13.0",
         "laravel/sanctum": "^4.3",
-        "laravel/tinker": "^3.0"
+        "laravel/tinker": "^3.0",
+        "league/flysystem-aws-s3-v3": "^3.0"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",
@@ -41,13 +42,17 @@
             "composer install",
             "@php -r \"file_exists('.env') || copy('.env.example', '.env');\"",
             "@php artisan key:generate",
+            "@php -r \"file_exists('database/database.sqlite') || touch('database/database.sqlite');\"",
             "@php artisan migrate --force",
             "npm install",
             "npm run build"
         ],
         "dev": [
             "Composer\\Config::disableProcessTimeout",
-            "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74\" \"php artisan serve\" \"php artisan queue:listen --tries=1 --timeout=0\" \"php artisan pail --timeout=0\" \"npm run dev\" --names=server,queue,logs,vite --kill-others"
+            "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74,#86efac\" \"php artisan serve --host=127.0.0.1 --port=9000\" \"php artisan queue:listen --tries=1 --timeout=0 --queue=audio,default\" \"php artisan pail --timeout=0\" \"npm run dev\" \"php artisan deepgram:relay\" --names=server,queue,logs,vite,relay"
+        ],
+        "dev:ios": [
+            "bash scripts/dev-ios-simulator.sh"
         ],
         "test": [
             "@php artisan config:clear --ansi",

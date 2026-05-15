@@ -18,12 +18,14 @@ class MeetingAnalytic extends Model
         'summary',
         'action_items',
         'sentiment',
+        'insights',
     ];
 
     protected $casts = [
         'keywords' => 'array',
         'action_items' => 'array',
         'sentiment' => 'array',
+        'insights' => 'array',
     ];
 
     public function meeting()

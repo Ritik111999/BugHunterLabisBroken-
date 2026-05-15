@@ -1,21 +1,22 @@
 <?php
 
-use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\Admin\UserController;
-use App\Http\Controllers\Admin\RoleController;
-use App\Http\Controllers\Admin\SupportController;
-use App\Http\Controllers\Admin\PageController;
-use App\Http\Controllers\Admin\AuthController as AdminAuthController;
-use App\Http\Controllers\Admin\MeetingController;
-use App\Http\Controllers\Admin\SubscriptionPlanController;
-use App\Http\Controllers\Admin\SubscriptionController;
-use App\Http\Controllers\Admin\SettingController;
-use App\Http\Controllers\Admin\FaqController;
-use App\Http\Controllers\Admin\SystemController;
-use App\Http\Controllers\Admin\PaymentController;
 use App\Http\Controllers\Admin\AdminAccountDeletionController;
+use App\Http\Controllers\Admin\AuthController as AdminAuthController;
+use App\Http\Controllers\Admin\FaqController;
+use App\Http\Controllers\Admin\MeetingController;
+use App\Http\Controllers\Admin\PageController;
+use App\Http\Controllers\Admin\PaymentController;
+use App\Http\Controllers\Admin\RoleController;
+use App\Http\Controllers\Admin\SettingController;
+use App\Http\Controllers\Admin\SubscriptionController;
+use App\Http\Controllers\Admin\SubscriptionPlanController;
+use App\Http\Controllers\Admin\SupportController;
+use App\Http\Controllers\Admin\SystemController;
+use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\PublicDeleteAccountController;
 use App\Models\Faq;
+use App\Models\Page;
+use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
     return redirect()->route('admin.auth.signin');
@@ -29,6 +30,43 @@ Route::get('/demo', function () {
     return view('meeting-demo');
 });
 
+Route::view('/app/{any?}', 'wechirp-app')
+    ->middleware('wechirp.native-vite')
+    ->where('any', '.*')
+    ->name('wechirp.app');
+
+Route::get('/manifest.webmanifest', function () {
+    $name = config('app.name', 'WeChirp');
+
+    return response()->json([
+        'name' => $name,
+        'short_name' => $name,
+        'description' => 'Meetings, live transcription, and analytics',
+        'start_url' => url('/app'),
+        'scope' => rtrim(url('/'), '/').'/',
+        'display' => 'standalone',
+        'background_color' => '#f8fafc',
+        'theme_color' => '#0f172a',
+        'icons' => [
+            [
+                'src' => url('/pwa/icon-192.png'),
+                'sizes' => '192x192',
+                'type' => 'image/png',
+                'purpose' => 'any',
+            ],
+            [
+                'src' => url('/pwa/icon-512.png'),
+                'sizes' => '512x512',
+                'type' => 'image/png',
+                'purpose' => 'any maskable',
+            ],
+        ],
+    ], 200, [
+        'Content-Type' => 'application/manifest+json',
+        'Cache-Control' => 'public, max-age=3600',
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+})->name('pwa.manifest');
+
 Route::get('/faqs', function () {
     $faqs = Faq::query()
         ->where('is_active', true)
@@ -40,10 +78,10 @@ Route::get('/faqs', function () {
 });
 
 Route::get('/legal/{type}', function (string $type) {
-    if (!in_array($type, ['privacy', 'terms', 'about'], true)) {
+    if (! in_array($type, ['privacy', 'terms', 'about'], true)) {
         abort(404);
     }
-    $page = \App\Models\Page::query()->where('type', $type)->firstOrFail();
+    $page = Page::query()->where('type', $type)->firstOrFail();
 
     return response()->view('public.legal-simple', [
         'title' => $page->title,
@@ -51,7 +89,7 @@ Route::get('/legal/{type}', function (string $type) {
     ]);
 })->name('public.legal');
 
-// Public account deletion (browser): GET http://localhost:8000/delete-account when APP_URL=http://localhost:8000
+// Public account deletion (browser): GET http://127.0.0.1:9000/delete-account when APP_URL matches that host.
 Route::middleware('throttle:delete-account-otp')->group(function () {
     Route::post('/delete-account/send-otp', [PublicDeleteAccountController::class, 'sendOtp'])->name('delete-account.send-otp');
     Route::post('/delete-account/verify-otp', [PublicDeleteAccountController::class, 'verifyOtp'])->name('delete-account.verify-otp');

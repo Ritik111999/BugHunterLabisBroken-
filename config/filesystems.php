@@ -38,6 +38,16 @@ return [
             'report' => false,
         ],
 
+        /*
+        | Intro + HTTP meeting chunks (dev default). Production: WECHIRP_AUDIO_DISK=s3.
+        */
+        'meeting_audio' => [
+            'driver' => 'local',
+            'root' => storage_path('app/meeting_audio'),
+            'throw' => false,
+            'report' => false,
+        ],
+
         'public' => [
             'driver' => 'local',
             'root' => storage_path('app/public'),
@@ -56,6 +66,7 @@ return [
             'url' => env('AWS_URL'),
             'endpoint' => env('AWS_ENDPOINT'),
             'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', false),
+            'root' => trim((string) env('WECHIRP_AUDIO_PREFIX', ''), '/'),
             'throw' => false,
             'report' => false,
         ],

@@ -4,31 +4,38 @@ namespace App\Jobs;
 
 use App\Models\MeetingParticipant;
 use App\Services\VoiceprintService;
+use App\Support\MeetingAudioStorage;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
 
 class ComputeIntroVoiceprintJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $meetingId;
+
     public int $participantId;
+
     public string $filePath;
+
     public int $chunkIndex;
+
     public ?float $maxSeconds;
 
-    public function __construct(int $meetingId, int $participantId, string $filePath, int $chunkIndex = 0, ?float $maxSeconds = null)
+    public ?string $audioInputProfile = null;
+
+    public function __construct(int $meetingId, int $participantId, string $filePath, int $chunkIndex = 0, ?float $maxSeconds = null, ?string $audioInputProfile = null)
     {
         $this->meetingId = $meetingId;
         $this->participantId = $participantId;
         $this->filePath = $filePath;
         $this->chunkIndex = $chunkIndex;
         $this->maxSeconds = $maxSeconds;
+        $this->audioInputProfile = $audioInputProfile;
     }
 
     public function handle(VoiceprintService $voiceprints): void
@@ -38,7 +45,7 @@ class ComputeIntroVoiceprintJob implements ShouldQueue
             ->where('meeting_id', $this->meetingId)
             ->first();
 
-        if (!$p) {
+        if (! $p) {
             return;
         }
 
@@ -49,15 +56,18 @@ class ComputeIntroVoiceprintJob implements ShouldQueue
             return;
         }
 
-        $abs = Storage::path($this->filePath);
-        $computed = $voiceprints->computeEcapa($abs, $this->maxSeconds);
-        if (!$computed) {
+        $computed = MeetingAudioStorage::withLocalPath(
+            $this->filePath,
+            fn (string $abs) => $voiceprints->computeEcapa($abs, $this->maxSeconds, $this->audioInputProfile),
+        );
+        if (! $computed) {
             Log::warning('intro_voiceprint_async_failed', [
                 'meeting_id' => $this->meetingId,
                 'participant_id' => $this->participantId,
                 'chunk_index' => $this->chunkIndex,
                 'file_path' => $this->filePath,
             ]);
+
             return;
         }
 
@@ -85,7 +95,7 @@ class ComputeIntroVoiceprintJob implements ShouldQueue
             $voiceprintsList = array_slice($voiceprintsList, -1 * $max);
         }
 
-        if (!$hasVp) {
+        if (! $hasVp) {
             $prev['voiceprint'] = $voiceprintsList[count($voiceprintsList) - 1];
         }
 
@@ -108,4 +118,3 @@ class ComputeIntroVoiceprintJob implements ShouldQueue
         ]);
     }
 }
-

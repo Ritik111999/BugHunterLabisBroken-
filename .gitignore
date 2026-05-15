@@ -9,6 +9,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+!.env.production.example
 
 # IDE / Editor
 /.fleet
@@ -37,6 +38,13 @@ pnpm-debug.log*
 # Python (you have scripts)
 /__pycache__/
 *.pyc
+/scripts/.venv/
+/storage/app/speechbrain_models/
+/storage/app/meeting_audio/
+/storage/app/private/meeting_chunks/
+/storage/app/private/meeting_live_ws/
+/resapp/
+/public/untitled folder/
 
 # Auth / Secrets
 auth.json

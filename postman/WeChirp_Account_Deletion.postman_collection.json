@@ -2,13 +2,13 @@
   "info": {
     "_postman_id": "a7f3c2d1-4e8b-4c1a-9f2d-6b5e4a3c2d10",
     "name": "WeChirp — Account deletion",
-    "description": "Public JSON API, browser web page, and authenticated app deletion.\n\n**Web form (browser):** `GET {{baseUrl}}/delete-account` — e.g. **http://localhost:8000/delete-account** when `php artisan serve` and `APP_URL=http://localhost:8000`.\n\n**Variables:** `baseUrl` (default http://localhost:8000), `token` (Bearer for app folder — run **Login** first or paste a Sanctum token).",
+    "description": "Public JSON API, browser web page, and authenticated app deletion.\n\n**Web form (browser):** `GET {{baseUrl}}/delete-account` — e.g. **http://127.0.0.1:9000/delete-account** when `php artisan serve` and `APP_URL=http://127.0.0.1:9000`.\n\n**Variables:** `baseUrl` (default http://127.0.0.1:9000), `token` (Bearer for app folder — run **Login** first or paste a Sanctum token).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
     {
       "name": "Web (browser)",
-      "description": "HTML form at `/delete-account` (session + CSRF + OTP). Open **http://localhost:8000/delete-account** in a browser for real use. Postman GET is only for quick checks.",
+      "description": "HTML form at `/delete-account` (session + CSRF + OTP). Open **http://127.0.0.1:9000/delete-account** in a browser for real use. Postman GET is only for quick checks.",
       "item": [
         {
           "name": "Delete account page",
@@ -16,7 +16,7 @@
             "method": "GET",
             "header": [],
             "url": "{{baseUrl}}/delete-account",
-            "description": "Public form: **http://localhost:8000/delete-account** with default `php artisan serve` and `APP_URL=http://localhost:8000`."
+            "description": "Public form: **http://127.0.0.1:9000/delete-account** with default `php artisan serve` and `APP_URL=http://127.0.0.1:9000`."
           },
           "response": []
         },
@@ -200,7 +200,7 @@
   "variable": [
     {
       "key": "baseUrl",
-      "value": "http://localhost:8000"
+      "value": "http://127.0.0.1:9000"
     },
     {
       "key": "token",

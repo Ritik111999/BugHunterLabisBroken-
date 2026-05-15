@@ -2,264 +2,284 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WeChirp · Meeting Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>WeChirp · Meetings</title>
+    @include('partials.pwa-head', ['pwaAppleTitle' => 'WeChirp'])
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: { brand: { DEFAULT: '#1AD0DE', dark: '#0ea5b5' } }
+                }
+            }
+        };
+    </script>
     <style>
-        .pill { @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium; }
+        .pill { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.2rem 0.55rem; border-radius: 9999px; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.02em; }
         pre { white-space: pre-wrap; word-break: break-word; }
+        details > summary { list-style: none; }
+        details > summary::-webkit-details-marker { display: none; }
+        .input-app {
+            width: 100%; border-radius: 0.875rem; border: 1px solid rgb(226 232 240);
+            background: rgb(248 250 252); padding: 0.7rem 1rem; font-size: 0.9375rem; outline: none;
+            transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+        }
+        .input-app:focus { border-color: #1AD0DE; background: #fff; box-shadow: 0 0 0 3px rgba(26, 208, 222, 0.22); }
+        .input-app-sm { font-size: 0.8125rem; padding: 0.5rem 0.75rem; border-radius: 0.75rem; }
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 min-h-screen">
-<div class="max-w-5xl mx-auto p-4 space-y-4 pb-16">
+<body class="min-h-[100dvh] min-h-screen bg-gradient-to-b from-slate-100 via-slate-50 to-slate-100 text-slate-900 antialiased pb-[max(1.5rem,env(safe-area-inset-bottom))]">
 
-    <!-- ── Header ── -->
-    <div class="flex flex-wrap items-start justify-between gap-3 pt-2">
-        <div>
-            <h1 class="text-2xl font-bold tracking-tight">WeChirp <span class="text-slate-400 font-normal">Meeting Demo</span></h1>
-            <p class="text-sm text-slate-500 mt-0.5">Test backend: Auth → Intro enrollment → Live meeting → Analytics</p>
+    <header class="sticky top-0 z-50 border-b border-slate-200/90 bg-white/90 backdrop-blur-lg shadow-sm shadow-slate-900/5 pt-[calc(0.65rem+env(safe-area-inset-top,0px))]">
+        <div class="mx-auto flex max-w-lg items-start justify-between gap-3 px-4 pb-3.5">
+            <div class="min-w-0">
+                <h1 class="text-xl font-bold tracking-tight text-slate-900 sm:text-[1.35rem]"><span class="text-[#1AD0DE]">We</span>Chirp</h1>
+                <p class="text-[0.7rem] font-medium uppercase tracking-wider text-slate-400">Meetings</p>
+            </div>
+            <div class="flex max-w-[58%] flex-wrap justify-end gap-1.5">
+                <span id="badgeApi" class="pill bg-slate-100 text-slate-500">API · …</span>
+                <span id="badgeWs" class="pill bg-slate-100 text-slate-500">WS · …</span>
+                <span id="badgeDeepgram" class="pill bg-slate-100 text-slate-500">STT · …</span>
+            </div>
         </div>
-        <div class="flex flex-wrap gap-2 text-xs text-slate-500 items-start">
-            <span id="badgeApi"    class="pill bg-slate-100 text-slate-500">API: –</span>
-            <span id="badgeWs"     class="pill bg-slate-100 text-slate-500">WS: –</span>
-            <span id="badgeDeepgram" class="pill bg-slate-100 text-slate-500">Deepgram: –</span>
-        </div>
-    </div>
+    </header>
 
-    <!-- ── Config panel ── -->
-    <div class="bg-white rounded-xl border p-4 space-y-3">
-        <div class="font-semibold text-sm text-slate-700">Configuration</div>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <label class="text-sm">
-                <div class="text-slate-500 mb-1">Base URL</div>
-                <input id="baseUrl" class="w-full border rounded px-3 py-1.5 font-mono text-xs" placeholder="http://127.0.0.1:8000" />
-            </label>
-            <label class="text-sm">
-                <div class="text-slate-500 mb-1">Relay WS URL</div>
-                <input id="relayWsUrl" class="w-full border rounded px-3 py-1.5 font-mono text-xs" placeholder="ws://127.0.0.1:8081" />
-            </label>
-            <label class="text-sm">
-                <div class="text-slate-500 mb-1">Meeting title</div>
-                <input id="meetingTitle" class="w-full border rounded px-3 py-1.5 text-xs" placeholder="Team Sync Q1" />
-            </label>
-        </div>
-        <button id="btnCheckApi" class="px-3 py-1.5 rounded bg-slate-900 text-white text-xs font-medium">Check connections</button>
-    </div>
+    <main class="mx-auto max-w-lg space-y-4 px-4 py-4">
 
-    <!-- ── Auth panel ── -->
-    <div class="bg-white rounded-xl border p-4 space-y-3">
-        <div class="flex items-center justify-between">
-            <div class="font-semibold text-sm text-slate-700">Authentication</div>
-            <div id="authStatus" class="text-xs text-slate-500">Not logged in</div>
-        </div>
-        <div id="authForms" class="space-y-3">
-            <div class="flex gap-2 border-b pb-3">
-                <button id="tabLogin"  class="text-xs font-medium px-3 py-1 rounded bg-blue-600 text-white">Login</button>
-                <button id="tabSignup" class="text-xs font-medium px-3 py-1 rounded bg-slate-100 text-slate-700">Signup</button>
-            </div>
-            <div id="formLogin" class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <label class="text-sm">
-                    <div class="text-slate-500 mb-1">Email</div>
-                    <input id="loginEmail" type="email" class="w-full border rounded px-3 py-1.5 text-xs" placeholder="you@example.com" />
-                </label>
-                <label class="text-sm">
-                    <div class="text-slate-500 mb-1">Password</div>
-                    <input id="loginPassword" type="password" class="w-full border rounded px-3 py-1.5 text-xs" placeholder="••••••••" />
-                </label>
-                <div class="flex items-end">
-                    <button id="btnLogin" class="px-4 py-1.5 rounded bg-blue-600 text-white text-xs font-medium w-full">Login</button>
-                </div>
-            </div>
-            <div id="formSignup" class="hidden grid grid-cols-1 md:grid-cols-4 gap-3">
-                <label class="text-sm">
-                    <div class="text-slate-500 mb-1">Name</div>
-                    <input id="signupName" class="w-full border rounded px-3 py-1.5 text-xs" placeholder="John Doe" />
-                </label>
-                <label class="text-sm">
-                    <div class="text-slate-500 mb-1">Email</div>
-                    <input id="signupEmail" type="email" class="w-full border rounded px-3 py-1.5 text-xs" />
-                </label>
-                <label class="text-sm">
-                    <div class="text-slate-500 mb-1">Password</div>
-                    <input id="signupPassword" type="password" class="w-full border rounded px-3 py-1.5 text-xs" />
-                </label>
-                <div class="flex items-end">
-                    <button id="btnSignup" class="px-4 py-1.5 rounded bg-emerald-600 text-white text-xs font-medium w-full">Signup</button>
-                </div>
-            </div>
-        </div>
-        <div id="authLoggedIn" class="hidden flex items-center justify-between">
-            <div class="text-sm">
-                Logged in as <strong id="authUserName"></strong>
-                <span class="text-xs text-slate-400 ml-2 font-mono" id="authTokenShort"></span>
-            </div>
-            <button id="btnLogout" class="text-xs text-red-600 underline">Logout</button>
-        </div>
-    </div>
-
-    <!-- ── Step 0: Create meeting ── -->
-    <div id="panelCreate" class="bg-white rounded-xl border p-4">
-        <div class="flex flex-wrap items-center gap-3">
-            <div class="flex-1 min-w-0">
-                <div class="font-semibold text-sm">Start a new meeting</div>
-                <div class="text-xs text-slate-500 mt-0.5">Creates the meeting, then walks you through intro enrollment and live recording.</div>
-            </div>
-            <div class="flex items-center gap-2">
-                <label class="flex items-center gap-2 text-xs text-slate-600 border rounded px-3 py-1.5">
-                    <input id="useWs" type="checkbox" class="h-3.5 w-3.5" checked />
-                    Use WebSocket
-                </label>
-                <button id="btnCreateMeeting" class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-semibold disabled:opacity-40" disabled>Create meeting</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- ── Step 1: Intro enrollment ── -->
-    <div id="stepIntro" class="hidden bg-white rounded-xl border p-5 space-y-4">
-        <div class="flex items-start justify-between gap-2">
+    <details class="overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-md shadow-slate-900/[0.04]">
+        <summary class="flex cursor-pointer select-none items-center justify-between gap-2 px-4 py-3.5 text-left active:bg-slate-50">
             <div>
-                <div class="text-xs text-slate-400 font-medium uppercase tracking-wide">Step 1 of 2</div>
-                <h2 class="text-lg font-semibold mt-0.5">Participant Introductions</h2>
-                <p class="text-sm text-slate-500">Each participant says: <span class="font-semibold text-slate-800">"My name is [name]"</span> clearly into the mic.</p>
+                <div class="text-sm font-semibold text-slate-800">Server & relay</div>
+                <div class="text-xs text-slate-500">Only change if you know the URL</div>
             </div>
-            <div class="text-right space-y-1">
-                <div class="text-xs text-slate-500">Meeting ID</div>
-                <div id="meetingIdLabel" class="font-mono text-sm font-bold text-blue-700">–</div>
-            </div>
-        </div>
-
-        <!-- Intro mode switch -->
-        <div class="flex gap-2">
-            <button id="btnIntroModeHttp" class="px-3 py-1.5 rounded text-xs font-medium bg-blue-600 text-white">HTTP chunks (Deepgram)</button>
-            <button id="btnIntroModeWs"   class="px-3 py-1.5 rounded text-xs font-medium bg-slate-100 text-slate-700">Via WebSocket (live)</button>
-        </div>
-
-        <!-- HTTP intro panel -->
-        <div id="introHttp" class="space-y-3">
-            <div class="flex flex-wrap items-center gap-3">
-                <button id="btnIntroEnroll" class="px-4 py-2 rounded bg-slate-900 text-white text-sm font-semibold">● Record intro</button>
-                <button id="btnIntroNext"   class="px-4 py-2 rounded bg-emerald-50 border border-emerald-300 text-emerald-800 text-sm font-semibold hidden">+ Add another</button>
-                <button id="btnIntroRetry"  class="px-4 py-2 rounded bg-amber-50 border border-amber-300 text-amber-800 text-sm font-semibold hidden">↺ Try again</button>
-                <label class="text-xs text-slate-500 flex items-center gap-2">
-                    Duration (s)
-                    <input id="introSeconds" class="w-16 border rounded px-2 py-1 font-mono text-xs" value="6" />
+            <span class="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-[0.65rem] font-semibold text-slate-600">Show</span>
+        </summary>
+        <div class="space-y-4 border-t border-slate-100 px-4 py-4">
+            <div class="space-y-3">
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">API base URL</span>
+                    <input id="baseUrl" type="text" class="input-app input-app-sm font-mono" placeholder="http://127.0.0.1:9000" autocomplete="off" />
+                </label>
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Relay WebSocket</span>
+                    <input id="relayWsUrl" type="text" class="input-app input-app-sm font-mono" placeholder="ws://127.0.0.1:9001" autocomplete="off" />
+                </label>
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Default meeting title</span>
+                    <input id="meetingTitle" type="text" class="input-app" placeholder="Team sync" />
                 </label>
             </div>
-            <div class="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-xs text-blue-800">
-                Audio is sent to <strong>Deepgram</strong> for speaker-labeled transcription → name extracted → stored in DB.
+            <button id="btnCheckApi" type="button" class="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 text-sm font-semibold text-slate-800 active:bg-slate-100">Refresh connection status</button>
+        </div>
+    </details>
+
+    <section class="overflow-hidden rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+        <div class="mb-4 flex items-center justify-between gap-2">
+            <h2 class="text-base font-bold text-slate-900">Account</h2>
+            <div id="authStatus" class="max-w-[55%] truncate text-right text-xs font-medium text-slate-500">Not signed in</div>
+        </div>
+        <div id="authForms" class="space-y-4">
+            <div class="grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1">
+                <button id="tabLogin" type="button" class="rounded-lg py-2.5 text-sm font-semibold shadow-sm transition bg-white text-slate-900">Sign in</button>
+                <button id="tabSignup" type="button" class="rounded-lg py-2.5 text-sm font-semibold text-slate-600 transition">Create account</button>
+            </div>
+            <div id="formLogin" class="space-y-3">
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Email</span>
+                    <input id="loginEmail" type="email" class="input-app" placeholder="you@company.com" autocomplete="username" />
+                </label>
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Password</span>
+                    <input id="loginPassword" type="password" class="input-app" placeholder="••••••••" autocomplete="current-password" />
+                </label>
+                <button id="btnLogin" type="button" class="mt-1 w-full rounded-xl bg-gradient-to-b from-cyan-400 to-[#1AD0DE] py-3.5 text-sm font-bold text-slate-900 shadow-md shadow-cyan-500/25 active:opacity-90">Sign in</button>
+            </div>
+            <div id="formSignup" class="hidden space-y-3">
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Name</span>
+                    <input id="signupName" type="text" class="input-app" placeholder="Your name" autocomplete="name" />
+                </label>
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Email</span>
+                    <input id="signupEmail" type="email" class="input-app" placeholder="you@company.com" autocomplete="email" />
+                </label>
+                <label class="block">
+                    <span class="mb-1.5 block text-xs font-semibold text-slate-600">Password</span>
+                    <input id="signupPassword" type="password" class="input-app" placeholder="8+ characters" autocomplete="new-password" />
+                </label>
+                <button id="btnSignup" type="button" class="mt-1 w-full rounded-xl bg-gradient-to-b from-emerald-400 to-emerald-600 py-3.5 text-sm font-bold text-white shadow-md shadow-emerald-500/25 active:opacity-90">Create account</button>
+            </div>
+        </div>
+        <div id="authLoggedIn" class="hidden flex flex-col gap-3 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
+            <div class="min-w-0 text-sm text-slate-700">
+                <span class="font-semibold text-slate-900" id="authUserName"></span>
+                <div class="mt-1 truncate font-mono text-[0.65rem] text-slate-400" id="authTokenShort"></div>
+            </div>
+            <button id="btnLogout" type="button" class="shrink-0 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-semibold text-red-700 active:bg-red-100">Sign out</button>
+        </div>
+    </section>
+
+    <section id="panelCreate" class="overflow-hidden rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+        <h2 class="text-lg font-bold leading-snug text-slate-900">New meeting</h2>
+        <p class="mt-2 text-sm leading-relaxed text-slate-600">Create the room, capture short voice intros, then start the live session.</p>
+        <label class="mt-5 flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3.5 active:bg-slate-100">
+            <input id="useWs" type="checkbox" class="mt-0.5 h-5 w-5 shrink-0 rounded border-slate-300 text-cyan-500 focus:ring-cyan-400" checked />
+            <span class="text-sm font-medium leading-snug text-slate-800">Use WebSocket for lowest-latency live audio</span>
+        </label>
+        <button id="btnCreateMeeting" type="button" class="mt-5 w-full rounded-xl bg-gradient-to-b from-cyan-400 to-[#1AD0DE] py-4 text-base font-bold text-slate-900 shadow-lg shadow-cyan-500/25 disabled:opacity-40 disabled:shadow-none" disabled>Create meeting</button>
+    </section>
+
+    <!-- Step 1: Intro enrollment -->
+    <div id="stepIntro" class="hidden space-y-5 rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+        <div class="space-y-3">
+            <div class="flex flex-row items-start justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                    <p class="text-[0.65rem] font-bold uppercase tracking-wider text-slate-400">Step 1 of 2</p>
+                    <h2 class="mt-1 text-xl font-bold leading-snug text-slate-900">Participant introductions</h2>
+                </div>
+                <div class="shrink-0 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-center">
+                    <div class="text-[0.6rem] font-semibold uppercase tracking-wide text-slate-500">Meeting</div>
+                    <div id="meetingIdLabel" class="font-mono text-lg font-bold leading-none text-cyan-700">–</div>
+                </div>
+            </div>
+            <p class="text-sm leading-relaxed text-slate-600">Everyone says <strong class="font-semibold text-slate-900">“My name is …”</strong> clearly into the mic so we can label voices.</p>
+        </div>
+
+        <div class="grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1">
+            <button id="btnIntroModeHttp" type="button" class="rounded-lg py-3 text-center text-xs font-bold leading-tight shadow-sm transition bg-white text-slate-900">HTTP<br><span class="font-semibold text-slate-500">chunks</span></button>
+            <button id="btnIntroModeWs" type="button" class="rounded-lg py-3 text-center text-xs font-semibold leading-tight text-slate-600 transition">WebSocket<br><span class="font-medium text-slate-500">live</span></button>
+        </div>
+
+        <div id="introHttp" class="space-y-4">
+            <div class="flex flex-col gap-2">
+                <button id="btnIntroEnroll" type="button" class="w-full rounded-xl bg-slate-900 py-3.5 text-sm font-bold text-white shadow-md active:bg-slate-800">● Record intro clip</button>
+                <div class="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                    <button id="btnIntroNext" type="button" class="hidden w-full rounded-xl border border-emerald-200 bg-emerald-50 py-3 text-sm font-bold text-emerald-900 sm:w-auto sm:min-w-[10rem]">+ Add another person</button>
+                    <button id="btnIntroRetry" type="button" class="hidden w-full rounded-xl border border-amber-200 bg-amber-50 py-3 text-sm font-bold text-amber-900 sm:w-auto sm:min-w-[10rem]">↺ Try again</button>
+                </div>
+                <label class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                    <span class="text-sm font-medium text-slate-700">Clip length (seconds)</span>
+                    <input id="introSeconds" type="text" inputmode="numeric" class="w-16 rounded-lg border border-slate-200 bg-white px-2 py-2 text-center font-mono text-sm font-semibold" value="6" />
+                </label>
+            </div>
+            <div class="rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-xs leading-relaxed text-cyan-950">
+                Audio is processed with <strong>Deepgram</strong> for speaker labels, then names are saved for this meeting.
             </div>
         </div>
 
-        <!-- WS intro panel -->
-        <div id="introWs" class="hidden space-y-2">
-            <div class="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 text-xs text-purple-800 space-y-1">
-                <div class="font-semibold">WebSocket intro mode — important</div>
-                <div>Click <em>Start meeting</em>, then <strong>each participant must say "My name is [name]"</strong> clearly into the mic at the beginning of the session. Deepgram will assign speaker labels and map them to names automatically.</div>
-                <div class="text-purple-600">If you already enrolled via HTTP chunks above, say the same name again in the live session — the system will merge them automatically.</div>
+        <div id="introWs" class="hidden space-y-3">
+            <div class="space-y-2 rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-xs leading-relaxed text-violet-950">
+                <p class="font-bold text-violet-900">Live WebSocket intro</p>
+                <p>After you tap <em>Start meeting</em>, each person should say <strong>“My name is …”</strong> at the beginning so labels map correctly.</p>
+                <p class="text-violet-800/90">If you already used HTTP clips, repeat the same name in the live session so we can merge them.</p>
             </div>
         </div>
 
-        <!-- Enrolled participants -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div class="border rounded-xl p-4 space-y-3">
-                <div class="flex items-center justify-between">
-                    <div class="font-semibold text-sm">Enrolled participants</div>
-                    <button id="btnRefreshParticipants" class="text-xs text-slate-500 underline">Refresh</button>
+        <div class="space-y-4">
+            <div class="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+                <div class="mb-3 flex items-center justify-between gap-2">
+                    <span class="text-sm font-bold text-slate-900">Enrolled</span>
+                    <button id="btnRefreshParticipants" type="button" class="rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-cyan-700 shadow-sm ring-1 ring-slate-200 active:bg-slate-50">Refresh</button>
                 </div>
                 <div id="participantList" class="space-y-2">
-                    <div class="text-xs text-slate-400">No participants yet.</div>
+                    <div class="text-sm text-slate-500">No one enrolled yet.</div>
                 </div>
             </div>
-            <div class="border rounded-xl p-4 space-y-2">
-                <div class="font-semibold text-sm">Intro log</div>
-                <pre id="introLog" class="bg-slate-950 text-slate-100 rounded p-3 text-xs h-44 overflow-auto"></pre>
+            <div class="rounded-xl border border-slate-200 p-4">
+                <div class="mb-2 text-sm font-bold text-slate-900">Activity</div>
+                <pre id="introLog" class="max-h-44 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[0.7rem] leading-relaxed text-slate-100"></pre>
             </div>
         </div>
 
-        <div class="flex items-center justify-between pt-1">
-            <label class="text-xs text-slate-500 flex items-center gap-2">
-                Meeting chunk (ms)
-                <input id="meetingChunkMs" class="w-20 border rounded px-2 py-1 font-mono text-xs" value="5000" />
+        <div class="flex flex-col gap-3 border-t border-slate-100 pt-4">
+            <label class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <span class="text-sm font-medium text-slate-700">Chunk size (ms)</span>
+                <input id="meetingChunkMs" type="text" inputmode="numeric" class="w-24 rounded-lg border border-slate-200 bg-white px-2 py-2 text-center font-mono text-sm font-semibold" value="5000" />
             </label>
-            <button id="btnStartMeeting" class="px-5 py-2.5 rounded bg-emerald-600 text-white text-sm font-bold disabled:opacity-40" disabled>Start meeting →</button>
+            <button id="btnStartMeeting" type="button" class="w-full rounded-xl bg-gradient-to-b from-emerald-500 to-emerald-700 py-4 text-base font-bold text-white shadow-lg shadow-emerald-600/25 disabled:opacity-40 disabled:shadow-none" disabled>Start meeting →</button>
         </div>
     </div>
 
-    <!-- ── Step 2: Live meeting ── -->
+    <!-- Step 2: Live meeting -->
     <div id="stepMeeting" class="hidden space-y-4">
-
-        <!-- Meeting header -->
-        <div class="bg-white rounded-xl border p-5">
-            <div class="flex flex-wrap items-start justify-between gap-4">
-                <div>
-                    <h2 id="meetingTitleLabel" class="text-lg font-semibold">Meeting</h2>
-                    <div class="text-3xl font-bold tabular-nums mt-1" id="elapsed">00:00:00</div>
+        <div class="rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                <div class="min-w-0">
+                    <h2 id="meetingTitleLabel" class="text-lg font-bold text-slate-900">Meeting</h2>
+                    <div id="elapsed" class="mt-2 text-4xl font-bold tabular-nums tracking-tight text-slate-900">00:00:00</div>
                 </div>
-                <div class="flex flex-col items-end gap-2">
-                    <div id="statusPill" class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-medium">
-                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                <div class="flex flex-col items-stretch gap-2 sm:items-end">
+                    <div id="statusPill" class="inline-flex items-center justify-center gap-2 self-start rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-900 sm:self-end">
+                        <span class="h-2 w-2 shrink-0 rounded-full bg-emerald-500 animate-pulse"></span>
                         <span id="statusText">Recording</span>
                     </div>
-                    <div id="wsStatusBadge" class="hidden text-xs text-slate-400 font-mono"></div>
+                    <div id="wsStatusBadge" class="hidden text-right text-[0.65rem] font-mono text-slate-400"></div>
                 </div>
             </div>
-            <div class="flex flex-wrap gap-2 mt-4">
-                <button id="btnPause"  class="px-4 py-2 rounded bg-slate-100 border text-sm font-medium">⏸ Pause</button>
-                <button id="btnResume" class="px-4 py-2 rounded bg-slate-900 text-white text-sm font-medium hidden">▶ Resume</button>
-                <button id="btnEnd"    class="ml-auto px-4 py-2 rounded bg-red-600 text-white text-sm font-semibold">■ End meeting</button>
+            <div class="mt-5 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                <button id="btnPause" type="button" class="w-full rounded-xl border border-slate-200 bg-slate-100 py-3 text-sm font-semibold text-slate-900 sm:w-auto sm:min-w-[8rem]">Pause</button>
+                <button id="btnResume" type="button" class="hidden w-full rounded-xl bg-slate-900 py-3 text-sm font-semibold text-white sm:w-auto sm:min-w-[8rem]">Resume</button>
+                <button id="btnEnd" type="button" class="w-full rounded-xl bg-red-600 py-3 text-sm font-bold text-white shadow-md shadow-red-600/20 sm:ml-auto sm:w-auto sm:min-w-[10rem]">End meeting</button>
             </div>
         </div>
 
-        <!-- Speaker stats -->
-        <div class="bg-white rounded-xl border p-5 space-y-4">
-            <div class="flex items-center justify-between">
-                <div class="font-semibold">Speaker talk time</div>
-                <div class="text-xs text-slate-500">Crosstalk: <strong><span id="crosstalkPct">0</span>%</strong></div>
+        <div class="rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+            <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <span class="text-base font-bold text-slate-900">Talk time</span>
+                <span class="text-xs font-medium text-slate-500">Crosstalk <strong class="text-slate-800"><span id="crosstalkPct">0</span>%</strong></span>
             </div>
             <div id="bars" class="space-y-3">
-                <div class="text-xs text-slate-400">Waiting for speech…</div>
+                <div class="text-sm text-slate-500">Waiting for speech…</div>
             </div>
-            <div class="border-t pt-3">
-                <div class="flex items-center justify-between">
-                    <div class="font-semibold text-sm">Voice matching (debug)</div>
-                    <div id="voiceConfig" class="text-xs text-slate-500 font-mono">–</div>
+            <div class="mt-4 border-t border-slate-100 pt-4">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-sm font-bold text-slate-900">Voice match</span>
+                    <span id="voiceConfig" class="max-w-[55%] truncate font-mono text-[0.65rem] text-slate-500">–</span>
                 </div>
-                <div id="voiceMatching" class="mt-2 text-xs text-slate-600 font-mono whitespace-pre-wrap">–</div>
+                <div id="voiceMatching" class="mt-2 font-mono text-[0.7rem] leading-relaxed whitespace-pre-wrap text-slate-600">–</div>
             </div>
         </div>
 
-        <!-- Live transcript -->
-        <div class="bg-white rounded-xl border p-5 space-y-3">
-            <div class="flex items-center justify-between">
-                <div class="font-semibold">Live transcript</div>
-                <span id="transcriptMode" class="text-xs text-slate-400"></span>
+        <div class="rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+            <div class="mb-3 flex items-center justify-between gap-2">
+                <span class="text-base font-bold text-slate-900">Live transcript</span>
+                <span id="transcriptMode" class="text-[0.65rem] font-medium text-slate-400"></span>
             </div>
-            <div id="liveTranscript" class="space-y-2 min-h-[80px]">
-                <div class="text-xs text-slate-400">Transcript will appear here…</div>
+            <div id="liveTranscript" class="min-h-[5rem] space-y-2">
+                <div class="text-sm text-slate-500">Transcript appears here…</div>
             </div>
         </div>
 
-        <!-- Event log -->
-        <div class="bg-white rounded-xl border p-5 space-y-2">
-            <div class="font-semibold text-sm">Event log</div>
-            <pre id="eventLog" class="bg-slate-950 text-slate-100 rounded p-3 text-xs h-40 overflow-auto"></pre>
+        <div class="rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
+            <div class="mb-2 text-sm font-bold text-slate-900">Event log</div>
+            <pre id="eventLog" class="max-h-40 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[0.7rem] leading-relaxed text-slate-100"></pre>
         </div>
     </div>
 
-    <!-- ── Step 3: Analytics ── -->
-    <div id="stepAnalytics" class="hidden bg-white rounded-xl border p-5 space-y-4">
+    <!-- Step 3: Analytics -->
+    <div id="stepAnalytics" class="hidden space-y-5 rounded-2xl border border-slate-200/90 bg-white p-5 shadow-lg shadow-slate-900/[0.06]">
         <div>
-            <div class="text-xs text-slate-400 font-medium uppercase tracking-wide">Meeting ended</div>
-            <h2 class="text-lg font-semibold mt-0.5">Final Analytics</h2>
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-slate-400">Meeting ended</p>
+            <h2 class="mt-1 text-xl font-bold text-slate-900">Insights</h2>
         </div>
         <div id="analyticsContent" class="space-y-4">
-            <div class="text-xs text-slate-400">Loading…</div>
+            <div class="text-sm text-slate-500">Loading…</div>
         </div>
-        <button id="btnNewMeeting" class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-semibold">+ New meeting</button>
+        <button id="btnNewMeeting" type="button" class="w-full rounded-xl bg-gradient-to-b from-cyan-400 to-[#1AD0DE] py-4 text-base font-bold text-slate-900 shadow-lg shadow-cyan-500/25">New meeting</button>
     </div>
 
-</div><!-- /container -->
+</main>
 
+@php
+    $wcMeetingDemoDefaults = [
+        'apiBase' => rtrim((string) config('app.url'), '/'),
+        'relayWs' => (string) config('services.wechirp.relay_ws_url'),
+    ];
+@endphp
+<script>
+window.__WC_DEMO_DEFAULTS__ = @json($wcMeetingDemoDefaults);
+</script>
 <script>
 const $ = (id) => document.getElementById(id);
 
@@ -308,8 +328,12 @@ function stopStatsPolling() {
 
 // ─────────────────────────── Persist ───────────────────────────
 function loadPrefs() {
-    $('baseUrl').value       = localStorage.getItem('wc.baseUrl')       || 'http://127.0.0.1:8000';
-    $('relayWsUrl').value    = localStorage.getItem('wc.relayWsUrl')    || 'ws://127.0.0.1:8081';
+    const D = window.__WC_DEMO_DEFAULTS__ || {};
+    const origin = (typeof window !== 'undefined' && window.location && window.location.origin)
+        ? window.location.origin
+        : '';
+    $('baseUrl').value       = localStorage.getItem('wc.baseUrl')       || origin || D.apiBase || 'http://127.0.0.1:9000';
+    $('relayWsUrl').value    = localStorage.getItem('wc.relayWsUrl')    || D.relayWs || 'ws://127.0.0.1:9001';
     $('meetingTitle').value  = localStorage.getItem('wc.meetingTitle')  || 'Team Sync Q1';
     $('introSeconds').value  = localStorage.getItem('wc.introSeconds')  || '6';
     $('meetingChunkMs').value= localStorage.getItem('wc.chunkMs')       || '5000';
@@ -360,10 +384,10 @@ async function checkConnections() {
     try {
         const wsBase = $('relayWsUrl').value.trim().replace(/\/$/, '').replace(/^ws/, 'http');
         const r = await fetch(wsBase + '/up', { signal: AbortSignal.timeout(3000) });
-        badge('badgeWs', r.ok, 'WS relay');
-    } catch { badge('badgeWs', false, 'WS relay'); }
+        badge('badgeWs', r.ok, 'Relay');
+    } catch { badge('badgeWs', false, 'Relay'); }
 
-    badge('badgeDeepgram', true, 'Deepgram');
+    badge('badgeDeepgram', true, 'STT');
 }
 
 function badge(id, ok, label) {
@@ -378,14 +402,14 @@ function badge(id, ok, label) {
 $('tabLogin').addEventListener('click', () => {
     $('formLogin').classList.remove('hidden');
     $('formSignup').classList.add('hidden');
-    $('tabLogin').className  = 'text-xs font-medium px-3 py-1 rounded bg-blue-600 text-white';
-    $('tabSignup').className = 'text-xs font-medium px-3 py-1 rounded bg-slate-100 text-slate-700';
+    $('tabLogin').className  = 'rounded-lg py-2.5 text-sm font-semibold shadow-sm transition bg-white text-slate-900';
+    $('tabSignup').className = 'rounded-lg py-2.5 text-sm font-semibold text-slate-600 transition';
 });
 $('tabSignup').addEventListener('click', () => {
     $('formSignup').classList.remove('hidden');
     $('formLogin').classList.add('hidden');
-    $('tabSignup').className = 'text-xs font-medium px-3 py-1 rounded bg-blue-600 text-white';
-    $('tabLogin').className  = 'text-xs font-medium px-3 py-1 rounded bg-slate-100 text-slate-700';
+    $('tabSignup').className = 'rounded-lg py-2.5 text-sm font-semibold shadow-sm transition bg-white text-slate-900';
+    $('tabLogin').className  = 'rounded-lg py-2.5 text-sm font-semibold text-slate-600 transition';
 });
 
 $('btnLogin').addEventListener('click', async () => {
@@ -428,7 +452,7 @@ $('btnLogout').addEventListener('click', () => {
     state.userName = '';
     localStorage.removeItem('wc.token');
     localStorage.removeItem('wc.userName');
-    $('authStatus').textContent = 'Not logged in';
+    $('authStatus').textContent = 'Not signed in';
     $('authForms').classList.remove('hidden');
     $('authLoggedIn').classList.add('hidden');
     $('btnCreateMeeting').disabled = true;
@@ -444,7 +468,7 @@ function showLoggedIn() {
     $('authLoggedIn').classList.remove('hidden');
     $('authUserName').textContent  = state.userName;
     $('authTokenShort').textContent = state.token.slice(0, 12) + '…';
-    $('authStatus').textContent = 'Authenticated ✓';
+    $('authStatus').textContent = 'Signed in';
     $('btnCreateMeeting').disabled = false;
 }
 
@@ -453,16 +477,16 @@ $('btnIntroModeHttp').addEventListener('click', () => {
     state.introMode = 'http';
     $('introHttp').classList.remove('hidden');
     $('introWs').classList.add('hidden');
-    $('btnIntroModeHttp').className = 'px-3 py-1.5 rounded text-xs font-medium bg-blue-600 text-white';
-    $('btnIntroModeWs').className   = 'px-3 py-1.5 rounded text-xs font-medium bg-slate-100 text-slate-700';
+    $('btnIntroModeHttp').className = 'rounded-lg py-3 text-center text-xs font-bold leading-tight shadow-sm transition bg-white text-slate-900';
+    $('btnIntroModeWs').className   = 'rounded-lg py-3 text-center text-xs font-semibold leading-tight text-slate-600 transition';
     updateStartBtn();
 });
 $('btnIntroModeWs').addEventListener('click', () => {
     state.introMode = 'ws';
     $('introWs').classList.remove('hidden');
     $('introHttp').classList.add('hidden');
-    $('btnIntroModeWs').className   = 'px-3 py-1.5 rounded text-xs font-medium bg-purple-600 text-white';
-    $('btnIntroModeHttp').className = 'px-3 py-1.5 rounded text-xs font-medium bg-slate-100 text-slate-700';
+    $('btnIntroModeWs').className   = 'rounded-lg py-3 text-center text-xs font-bold leading-tight shadow-sm transition bg-violet-600 text-white';
+    $('btnIntroModeHttp').className = 'rounded-lg py-3 text-center text-xs font-semibold leading-tight text-slate-600 transition';
     // WS intro: always enable Start (intro happens in session)
     $('btnStartMeeting').disabled = false;
 });
@@ -499,7 +523,7 @@ function renderParticipants() {
     wrap.innerHTML = '';
     const real = state.participants.filter(p => !isPlaceholder(p.name));
     if (real.length === 0) {
-        wrap.innerHTML = '<div class="text-xs text-slate-400">No participants enrolled yet.</div>';
+        wrap.innerHTML = '<div class="text-sm text-slate-500">No one enrolled yet.</div>';
         return;
     }
     real.forEach(p => {
@@ -512,7 +536,7 @@ function renderParticipants() {
             : null;
 
         const el = document.createElement('div');
-        el.className = 'border rounded-lg px-3 py-2.5 space-y-1.5';
+        el.className = 'rounded-xl border border-slate-200 bg-white px-3 py-3 space-y-2 shadow-sm';
         el.innerHTML = `
             <div class="flex items-center justify-between gap-2">
                 <div class="font-semibold text-sm">${p.name}</div>
@@ -608,9 +632,15 @@ async function enrollOneParticipant() {
 
     // sync=1 runs Deepgram+analyzer in the HTTP request (no queue worker needed for local demos).
     const res = await api(`/api/meetings/${state.meetingId}/intro/chunk?sync=1`, { method: 'POST', body: fd });
-    logIntro(`✓ Processed: status=${res?.status || 'ok'}`);
 
     if (res?.status === 'failed') throw new Error(String(res.error || 'analyzer_failed'));
+
+    const heardLines = Array.isArray(res?.heard) ? res.heard.filter((h) => h?.text && String(h.text).trim()) : [];
+    logIntro(
+        heardLines.length > 0
+            ? `✓ Processing finished — ${heardLines.length} speech line(s) from this clip.`
+            : '✓ Processing finished — no transcribed speech in this clip (silence, levels, or noise).',
+    );
 
     // Fast-path: use server response to update UI instantly.
     const enrolled = Array.isArray(res?.enrolled_participants) ? res.enrolled_participants : [];
@@ -1257,9 +1287,30 @@ $('btnNewMeeting').addEventListener('click', () => {
 // ─────────────────────────── Boot ───────────────────────────
 $('btnCheckApi').addEventListener('click', () => { savePrefs(); checkConnections(); });
 
+async function openMeetingFromAppQuery() {
+    const q = new URLSearchParams(window.location.search).get('meeting');
+    if (!q || !/^\d+$/.test(q) || !state.token) return;
+    const mid = parseInt(q, 10);
+    try {
+        const m = await api('/api/meetings/' + mid);
+        state.meetingId = mid;
+        $('meetingIdLabel').textContent = String(mid);
+        $('meetingTitleLabel').textContent = m.title || 'Meeting';
+        $('panelCreate')?.classList.add('hidden');
+        $('stepIntro')?.classList.remove('hidden');
+        await refreshParticipants();
+        updateStartBtn();
+        logIntro(`Opened meeting #${mid} from app`);
+    } catch (e) {
+        logIntro('Open from app failed: ' + e.message);
+    }
+}
+
 loadPrefs();
-checkConnections();
 introUi('idle');
+void openMeetingFromAppQuery();
+checkConnections();
 </script>
+@include('partials.pwa-register')
 </body>
 </html>

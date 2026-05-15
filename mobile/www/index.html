@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: gap: https://ssl.gstatic.com 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; media-src *; img-src * data: content:; connect-src 'self' https: http: ws: wss:;" />
+    <title>WeChirp</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        padding: 2rem;
+        text-align: center;
+        color: #333;
+      }
+    </style>
+  </head>
+  <body>
+    <p><strong>WeChirp</strong> (native shell)</p>
+    <p style="font-size: 0.9rem; max-width: 28rem; margin: 1rem auto; line-height: 1.5">
+      When <code>server.url</code> is set in <code>mobile/capacitor.config.js</code> (from your repo root
+      <code>.env</code> <code>APP_URL</code> + <code>/app</code>),
+      this file is not shown — the WebView loads your Laravel app from that URL (same
+      origin as the WeChirp SPA, e.g. <code>/app</code>).
+    </p>
+    <p style="font-size: 0.85rem; opacity: 0.75">
+      For a purely bundled build (no live server), copy your built web assets into
+      <code>mobile/www</code> and remove or clear <code>server.url</code>, then run
+      <code>npx cap sync</code>.
+    </p>
+  </body>
+</html>

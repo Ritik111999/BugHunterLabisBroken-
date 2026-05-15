@@ -9,12 +9,16 @@ use App\Models\MeetingParticipant;
 use App\Models\ParticipantStat;
 use App\Models\SpeakerMapping;
 use App\Models\Transcript;
+use App\Support\IntroEnrollmentPolicy;
+use App\Support\MeetingAudioStorage;
+use App\Support\MlPythonEnv;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -27,10 +31,29 @@ class ProcessChunkJob implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $meetingId;
+
     public ?string $filePath;
+
     public int $chunkIndex;
+
     public string $mode;
+
     public ?float $durationSeconds = null;
+
+    public ?string $audioInputProfile = null;
+
+    /**
+     * Optional: merge this utterance into intro STT as speaker_0 (local, MEETING_INTRO_ALLOW_ASSISTANT_UTTERANCE,
+     * or Capacitor shell when MEETING_INTRO_ALLOW_ASSISTANT_UTTERANCE_CAPACITOR is true).
+     */
+    public ?string $assistantUtterance = null;
+
+    /**
+     * Optional: when STT returns no usable name, treat text as "My name is {participant.name}" for this row
+     * (local/dev + simulator). Requires MEETING_INTRO_ALLOW_MANUAL_BIND or APP_ENV=local.
+     */
+    public ?int $bindParticipantId = null;
+
     private ?string $lastVoiceprintEngine = null;
 
     public function __construct(
@@ -38,20 +61,21 @@ class ProcessChunkJob implements ShouldQueue
         ?string $filePath = null,
         int $chunkIndex = 0,
         string $mode = 'meeting',
-        ?float $durationSeconds = null
-    )
-    {
+        ?float $durationSeconds = null,
+        ?string $audioInputProfile = null
+    ) {
         $this->meetingId = $meetingId;
         $this->filePath = $filePath;
         $this->chunkIndex = $chunkIndex;
         $this->mode = $mode;
         $this->durationSeconds = $durationSeconds;
+        $this->audioInputProfile = $audioInputProfile;
     }
 
     public function handle(): void
     {
         $statsKey = $this->statsCacheKey($this->meetingId);
-        $lockKey = $statsKey . '_lock';
+        $lockKey = $statsKey.'_lock';
 
         $lock = Cache::lock($lockKey, 10);
 
@@ -106,13 +130,91 @@ class ProcessChunkJob implements ShouldQueue
 
     private function analyzeChunk(): array
     {
-        if (!$this->filePath) {
+        if (! $this->filePath) {
             return $this->mockAnalysis();
         }
 
-        $absolutePath = Storage::path($this->filePath);
+        $analysis = MeetingAudioStorage::withLocalPath($this->filePath, function (string $absolutePath): array {
+            return $this->runPythonAnalyzer($absolutePath);
+        });
 
-        return $this->runPythonAnalyzer($absolutePath);
+        $assistant = trim((string) ($this->assistantUtterance ?? ''));
+        if ($this->mode === 'intro' && $assistant !== '') {
+            $speakerText = is_array($analysis['speaker_text'] ?? null) ? $analysis['speaker_text'] : [];
+            $speakerText['speaker_0'] = trim(($speakerText['speaker_0'] ?? '').' '.$assistant);
+            $analysis['speaker_text'] = $speakerText;
+            $sec = max(1, (int) ($analysis['total_seconds'] ?? 0));
+            if ($sec < 1) {
+                $sec = 3;
+            }
+            $analysis['speakers'] = ['speaker_0' => $sec];
+            $analysis['overlap_seconds'] = (int) ($analysis['overlap_seconds'] ?? 0);
+        }
+
+        if ($this->mode === 'intro' && $this->introManualBindAllowed() && $this->bindParticipantId !== null) {
+            $analysis = $this->mergeIntroManualBindSpeakerText($analysis);
+        }
+
+        return $analysis;
+    }
+
+    private function introManualBindAllowed(): bool
+    {
+        return IntroEnrollmentPolicy::manualBindAllowed();
+    }
+
+    private function isIntroManualBindPlaceholderName(string $name): bool
+    {
+        return (bool) preg_match('/^(Speaker\s+\d+|speaker_\d+|speaker_unknown|chunk\d+_\S+)$/i', trim($name));
+    }
+
+    /**
+     * When Deepgram returns no words, optionally attach this clip to an existing named participant
+     * by synthesizing enrollment text (same pipeline as a successful "My name is …").
+     *
+     * @param  array<string, mixed>  $analysis
+     * @return array<string, mixed>
+     */
+    private function mergeIntroManualBindSpeakerText(array $analysis): array
+    {
+        $speakerText = is_array($analysis['speaker_text'] ?? null) ? $analysis['speaker_text'] : [];
+        foreach ($speakerText as $txt) {
+            if ($this->extractNameFromText((string) $txt) !== null) {
+                return $analysis;
+            }
+        }
+
+        $participant = MeetingParticipant::query()
+            ->where('meeting_id', $this->meetingId)
+            ->whereKey((int) $this->bindParticipantId)
+            ->first(['id', 'name']);
+        if (! $participant) {
+            return $analysis;
+        }
+
+        $displayName = trim((string) $participant->name);
+        if ($displayName === '' || $this->isIntroManualBindPlaceholderName($displayName)) {
+            return $analysis;
+        }
+
+        $phrase = 'My name is '.$displayName;
+        $speakerText['speaker_0'] = trim(($speakerText['speaker_0'] ?? '').' '.$phrase);
+        $analysis['speaker_text'] = $speakerText;
+        $sec = max(1, (int) ($analysis['total_seconds'] ?? 0));
+        if ($sec < 1) {
+            $sec = 3;
+        }
+        $analysis['speakers'] = ['speaker_0' => $sec];
+        $analysis['overlap_seconds'] = (int) ($analysis['overlap_seconds'] ?? 0);
+
+        Log::info('intro_manual_bind_applied', [
+            'meeting_id' => $this->meetingId,
+            'chunk_index' => $this->chunkIndex,
+            'participant_id' => (int) $participant->id,
+            'name' => $displayName,
+        ]);
+
+        return $analysis;
     }
 
     private function mockAnalysis(): array
@@ -141,6 +243,12 @@ class ProcessChunkJob implements ShouldQueue
         $python = (string) config('meeting_analytics.analyzer.python', 'python3');
         $script = (string) config('meeting_analytics.analyzer.script');
         $timeout = (int) config('meeting_analytics.analyzer.timeout_seconds', 60);
+        if ($this->mode === 'intro') {
+            $introCap = (int) config('meeting_voice.intro_analyzer_timeout_seconds', 0);
+            if ($introCap > 0) {
+                $timeout = min($timeout, $introCap);
+            }
+        }
         $sttProvider = strtolower(trim((string) env('MEETING_STT_PROVIDER', 'deepgram')));
         $deepgramKey = (string) (env('DEEPGRAM_API_KEY', '') ?: getenv('DEEPGRAM_API_KEY') ?: '');
         $pulseKey = trim((string) (config('services.pulse.api_key') ?: env('PULSE_API_KEY', '')));
@@ -151,11 +259,11 @@ class ProcessChunkJob implements ShouldQueue
         // In intro enrollment mode, name detection requires speech-to-text.
         // Silently falling back to mock analysis makes the UI look "broken"
         // (no participants ever get enrolled), so we fail loudly instead.
-        if ($this->mode === 'intro' && !$hasStt) {
+        if ($this->mode === 'intro' && ! $hasStt) {
             $hint = $sttProvider === 'pulse'
                 ? 'Set PULSE_API_KEY (and MEETING_STT_PROVIDER=pulse).'
                 : 'Set DEEPGRAM_API_KEY (or switch MEETING_STT_PROVIDER=pulse with PULSE_API_KEY).';
-            throw new \RuntimeException('Intro enrollment requires speech-to-text: ' . $hint);
+            throw new \RuntimeException('Intro enrollment requires speech-to-text: '.$hint);
         }
 
         // FIX #1:
@@ -182,16 +290,21 @@ class ProcessChunkJob implements ShouldQueue
             '--max-seconds',
             (string) ($this->durationSeconds ?? 0),
         ]);
-        $process->setEnv(array_merge($_SERVER, $_ENV, [
+        $audioProfile = $this->resolvedAudioInputProfile();
+        $deepgramModel = trim((string) config('meeting_voice.deepgram_prerecord_model', 'nova-2')) ?: 'nova-2';
+
+        $process->setEnv(array_merge($_SERVER, $_ENV, MlPythonEnv::forSubprocess(), [
             'DEEPGRAM_API_KEY' => $deepgramKey,
             'MEETING_STT_PROVIDER' => $sttProvider,
             'PULSE_API_KEY' => $pulseKey,
+            'MEETING_AUDIO_INPUT_PROFILE' => $audioProfile,
+            'MEETING_DEEPGRAM_PRERECORD_MODEL' => $deepgramModel,
             'PATH' => $this->buildPath(),
         ]));
         $process->setTimeout($timeout + 5);
         $process->run();
 
-        if (!$process->isSuccessful()) {
+        if (! $process->isSuccessful()) {
             $stderr = trim((string) $process->getErrorOutput());
             $stdout = trim((string) $process->getOutput());
             $exit = (int) $process->getExitCode();
@@ -206,18 +319,20 @@ class ProcessChunkJob implements ShouldQueue
                 $reason = $errorFromStdout ?: ($stderr !== '' ? $stderr : ($stdout !== '' ? $stdout : 'unknown_error'));
                 throw new \RuntimeException("Analyzer failed (exit={$exit}): {$reason}");
             }
+
             return $this->mockAnalysis();
         }
 
         $decoded = json_decode($process->getOutput(), true);
-        if (!is_array($decoded)) {
+        if (! is_array($decoded)) {
             if ($hasStt) {
                 throw new \RuntimeException('Analyzer returned invalid JSON.');
             }
+
             return $this->mockAnalysis();
         }
         if ($hasStt && isset($decoded['error'])) {
-            throw new \RuntimeException('Analyzer error: ' . (string) $decoded['error']);
+            throw new \RuntimeException('Analyzer error: '.(string) $decoded['error']);
         }
 
         $totalSeconds = (int) ($decoded['total_seconds'] ?? 0);
@@ -231,7 +346,7 @@ class ProcessChunkJob implements ShouldQueue
             $normalizedSpeakers[(string) $name] = (int) $seconds;
         }
 
-        if ($hasStt && count($normalizedSpeakers) === 1 && array_key_exists('Unknown', $normalizedSpeakers)) {
+        if ($hasStt && $this->mode !== 'intro' && count($normalizedSpeakers) === 1 && array_key_exists('Unknown', $normalizedSpeakers)) {
             throw new \RuntimeException('Analyzer did not diarize (Unknown speaker).');
         }
 
@@ -258,7 +373,7 @@ class ProcessChunkJob implements ShouldQueue
         foreach ($analysisSpeakers as $speaker => $seconds) {
             // FIX #2: Namespace speaker labels by chunk index so speaker_0 in chunk 1
             // never collides with speaker_0 in chunk 2.
-            $scopedLabel = 'chunk' . $this->chunkIndex . '_' . (string) $speaker;
+            $scopedLabel = 'chunk'.$this->chunkIndex.'_'.(string) $speaker;
             $stats['users'][$scopedLabel] = ((int) ($stats['users'][$scopedLabel] ?? 0)) + (int) $seconds;
         }
 
@@ -267,19 +382,19 @@ class ProcessChunkJob implements ShouldQueue
         $stats['speaker_text'] = is_array($stats['speaker_text'] ?? null) ? $stats['speaker_text'] : [];
         foreach ($analysisSpeakerText as $label => $text) {
             // Also namespace incoming speaker text keys by chunk index.
-            $scopedLabel = 'chunk' . $this->chunkIndex . '_' . (string) $label;
+            $scopedLabel = 'chunk'.$this->chunkIndex.'_'.(string) $label;
             $text = trim((string) $text);
             if ($text === '') {
                 continue;
             }
-            $stats['speaker_text'][$scopedLabel] = trim(((string) ($stats['speaker_text'][$scopedLabel] ?? '')) . ' ' . $text);
+            $stats['speaker_text'][$scopedLabel] = trim(((string) ($stats['speaker_text'][$scopedLabel] ?? '')).' '.$text);
         }
 
         // Store latest speaker embeddings per scoped label (for voice recognition).
         $stats['speaker_embeddings'] = is_array($stats['speaker_embeddings'] ?? null) ? $stats['speaker_embeddings'] : [];
         foreach ($analysisSpeakerEmbeddings as $label => $embedding) {
-            $scopedLabel = 'chunk' . $this->chunkIndex . '_' . (string) $label;
-            if (!is_array($embedding) || count($embedding) === 0) {
+            $scopedLabel = 'chunk'.$this->chunkIndex.'_'.(string) $label;
+            if (! is_array($embedding) || count($embedding) === 0) {
                 continue;
             }
             $vec = [];
@@ -315,53 +430,123 @@ class ProcessChunkJob implements ShouldQueue
         );
         $t = preg_replace('/\s+/', ' ', $t) ?? $t;
 
-        // Match common enrollment phrases. Capture up to 3 words (letters) for full names.
-        // We still take the LAST match in meeting mode to avoid bleed-over from earlier speakers.
+        // Match common enrollment phrases. Names: letters / unicode letters, apostrophe, hyphen.
+        // Capture up to 3 name tokens for full names (e.g. "Mary Jane Watson").
         $matches = [];
         preg_match_all(
-            '/\b(?:my name is|my name\'s|i am|this is|it\'s|its|im|i\'m|call me|you can call me)\s+([a-z][a-z]{1,29}(?:\s+[a-z][a-z]{1,29}){0,2})\b/iu',
+            '/\b(?:my name is|my name\'s|name is|the name is|i am|this is|it\'s|its|im|i\'m|call me|you can call me)\s+((?:[\p{L}\'\-]{1,30})(?:\s+[\p{L}\'\-]{1,30}){0,2})\b/iu',
             $t,
             $matches
         );
 
-        if (empty($matches[1])) {
-            return null;
+        if (! empty($matches[1])) {
+            $useFirst = $this->mode === 'intro';
+            $raw = $useFirst
+                ? trim((string) ($matches[1][0] ?? ''))
+                : trim((string) end($matches[1]));
+            $normalized = $this->normalizeExtractedNameWords($raw, false);
+            if ($normalized !== null) {
+                return $normalized;
+            }
         }
 
-        // Intro clips are intended to contain a single participant name at the start.
-        // If another name bleeds into the end of the clip, taking the LAST match
-        // can incorrectly save David's voiceprint under Getty (or vice versa).
-        $useFirst = $this->mode === 'intro';
-        $raw = $useFirst
-            ? trim((string) ($matches[1][0] ?? ''))
-            : trim((string) end($matches[1]));
-        $raw = preg_replace('/[^a-z\s]/i', '', $raw) ?? $raw;
-        $raw = trim(preg_replace('/\s+/', ' ', $raw) ?? $raw);
+        // Intro-only: user often says only "Ritik" or "Hi, Ritik" without the full phrase.
+        if ($this->mode === 'intro') {
+            return $this->extractNameFromPlainIntroUtterance($text);
+        }
 
-        // Drop common trailing filler words if present.
-        // Example: "Amit sir" -> "Amit"
-        $parts = $raw === '' ? [] : explode(' ', $raw);
-        $filler = ['sir', 'mam', 'maam', 'ji', 'hello', 'hi', 'hey'];
-        while (!empty($parts) && in_array(strtolower((string) end($parts)), $filler, true)) {
+        return null;
+    }
+
+    /**
+     * Turn a raw captured name substring into a display name, or null if unusable.
+     */
+    /**
+     * @param  bool  $plainIntroUtterance  True when intro STT returned a short line without "my name is …"
+     */
+    private function normalizeExtractedNameWords(string $raw, bool $plainIntroUtterance): ?string
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return null;
+        }
+        // Keep letters (unicode), apostrophe, hyphen; drop digits / punctuation clutter.
+        $raw = preg_replace('/[^\p{L}\'\-\s]/u', '', $raw) ?? $raw;
+        $raw = trim(preg_replace('/\s+/u', ' ', $raw) ?? $raw);
+
+        $parts = $raw === '' ? [] : (preg_split('/\s+/u', $raw, -1, PREG_SPLIT_NO_EMPTY) ?: []);
+        $partsBeforeFiller = $parts;
+        // Leading/trailing noise only — do not drop "test" / real single-token names used in short intro clips.
+        $edgeFiller = ['sir', 'mam', 'maam', 'ji', 'hello', 'hi', 'hey', 'thanks', 'thank', 'yes', 'no', 'ok', 'okay', 'speaking', 'everyone', 'guys', 'here'];
+        while (! empty($parts) && in_array(mb_strtolower((string) $parts[0]), $edgeFiller, true)) {
+            array_shift($parts);
+        }
+        while (! empty($parts) && in_array(mb_strtolower((string) end($parts)), $edgeFiller, true)) {
             array_pop($parts);
         }
         $raw = trim(implode(' ', $parts));
 
-        if ($raw === '' || strlen(str_replace(' ', '', $raw)) < 2) {
+        if ($raw === '' && $plainIntroUtterance && count($partsBeforeFiller) >= 1 && count($partsBeforeFiller) <= 3) {
+            $blockedSingle = ['hi', 'hey', 'hello', 'thanks', 'thank', 'yes', 'no', 'ok', 'okay', 'bye', 'um', 'uh', 'hmm'];
+            if (count($partsBeforeFiller) === 1) {
+                $solo = mb_strtolower((string) $partsBeforeFiller[0]);
+                if (! in_array($solo, $blockedSingle, true)) {
+                    $raw = trim((string) $partsBeforeFiller[0]);
+                }
+            } else {
+                $raw = trim(implode(' ', $partsBeforeFiller));
+            }
+        }
+
+        if ($raw === '' || mb_strlen(str_replace([' ', "'", '-'], '', $raw)) < 2) {
             return null;
         }
 
-        $words = array_values(array_filter(explode(' ', $raw), fn ($w) => $w !== ''));
-        if (count($words) === 0) {
+        $words = preg_split('/\s+/u', $raw, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        if (count($words) === 0 || count($words) > 3) {
             return null;
         }
 
-        $words = array_map(
-            fn ($w) => ucfirst(strtolower((string) $w)),
-            $words
-        );
+        $out = [];
+        foreach ($words as $w) {
+            $out[] = mb_convert_case((string) $w, MB_CASE_TITLE, 'UTF-8');
+        }
 
-        return implode(' ', $words);
+        return implode(' ', $out);
+    }
+
+    /**
+     * When the model returns a short line without "my name is …", treat 1–3 word lines as a name.
+     */
+    private function extractNameFromPlainIntroUtterance(string $text): ?string
+    {
+        $snippet = trim((string) $text);
+        if ($snippet === '') {
+            return null;
+        }
+        if (mb_strlen($snippet) > 56) {
+            return null;
+        }
+        // First sentence / clause only to reduce bleed.
+        if (preg_match('/^(.{1,120}?)([.?!]|$)/u', $snippet, $m)) {
+            $snippet = trim((string) ($m[1] ?? $snippet));
+        }
+        $snippet = preg_replace('/\s+/u', ' ', $snippet) ?? $snippet;
+
+        return $this->normalizeExtractedNameWords($snippet, true);
+    }
+
+    /**
+     * Per-chunk mic path: request override (intro upload) or MEETING_AUDIO_INPUT_PROFILE from config.
+     */
+    private function resolvedAudioInputProfile(): string
+    {
+        $p = $this->audioInputProfile;
+        if ($p === null || trim((string) $p) === '') {
+            $p = (string) config('meeting_voice.input_profile', 'default');
+        }
+
+        return strtolower(trim((string) $p));
     }
 
     /**
@@ -386,7 +571,7 @@ class ProcessChunkJob implements ShouldQueue
         // Auto-detect: find whichever directory actually contains ffprobe.
         $detected = null;
         foreach ($candidates as $dir) {
-            if (is_executable($dir . '/ffprobe')) {
+            if (is_executable($dir.'/ffprobe')) {
                 $detected = $dir;
                 break;
             }
@@ -414,12 +599,14 @@ class ProcessChunkJob implements ShouldQueue
         $labelToName = [];
         foreach ($rows as $r) {
             $lbl = (string) ($r->speaker_label ?? '');
-            if ($lbl === '') continue;
+            if ($lbl === '') {
+                continue;
+            }
             $labelToName[$lbl] = (string) ($r->participant?->name ?? $lbl);
         }
 
         $full = trim(implode("\n", array_map(
-            fn ($label, $t) => '[' . (string) ($labelToName[(string) $label] ?? (string) $label) . '] ' . trim((string) $t),
+            fn ($label, $t) => '['.(string) ($labelToName[(string) $label] ?? (string) $label).'] '.trim((string) $t),
             array_keys($speakerText),
             array_values($speakerText),
         )));
@@ -440,10 +627,10 @@ class ProcessChunkJob implements ShouldQueue
         $words = array_filter(explode(' ', trim($t)), fn ($w) => $w !== '');
 
         $stop = array_flip([
-            'the','a','an','and','or','but','to','of','in','on','for','with','is','are','was','were','be','been',
-            'i','you','we','they','he','she','it','my','your','our','their','me','him','her','them',
-            'this','that','these','those','so','as','at','by','from','not','do','did','does','have','has','had',
-            'can','could','will','would','should','may','might','am','im','i\'m','my','name','says','say',
+            'the', 'a', 'an', 'and', 'or', 'but', 'to', 'of', 'in', 'on', 'for', 'with', 'is', 'are', 'was', 'were', 'be', 'been',
+            'i', 'you', 'we', 'they', 'he', 'she', 'it', 'my', 'your', 'our', 'their', 'me', 'him', 'her', 'them',
+            'this', 'that', 'these', 'those', 'so', 'as', 'at', 'by', 'from', 'not', 'do', 'did', 'does', 'have', 'has', 'had',
+            'can', 'could', 'will', 'would', 'should', 'may', 'might', 'am', 'im', 'i\'m', 'my', 'name', 'says', 'say',
         ]);
 
         $counts = [];
@@ -455,6 +642,7 @@ class ProcessChunkJob implements ShouldQueue
         }
 
         arsort($counts);
+
         return array_slice(array_keys($counts), 0, 8);
     }
 
@@ -464,14 +652,15 @@ class ProcessChunkJob implements ShouldQueue
         if ($t === '') {
             return '';
         }
+
         return mb_substr($t, max(0, mb_strlen($t) - 500));
     }
 
     private function simpleSentiment(string $text): array
     {
         $t = strtolower($text);
-        $pos = ['good','great','nice','love','like','excellent','amazing','awesome','happy','thanks','thank'];
-        $neg = ['bad','hate','issue','problem','sad','angry','terrible','awful','worse','worst','fail','error'];
+        $pos = ['good', 'great', 'nice', 'love', 'like', 'excellent', 'amazing', 'awesome', 'happy', 'thanks', 'thank'];
+        $neg = ['bad', 'hate', 'issue', 'problem', 'sad', 'angry', 'terrible', 'awful', 'worse', 'worst', 'fail', 'error'];
         $p = 0;
         $n = 0;
         foreach ($pos as $w) {
@@ -481,6 +670,7 @@ class ProcessChunkJob implements ShouldQueue
             $n += substr_count($t, $w);
         }
         $score = $p - $n;
+
         return [
             'label' => $score > 0 ? 'positive' : ($score < 0 ? 'negative' : 'neutral'),
             'score' => $score,
@@ -507,10 +697,30 @@ class ProcessChunkJob implements ShouldQueue
         return [$participants, $crosstalkPercentage];
     }
 
+    /**
+     * Same rule as the Studio list + MeetingController::start: at least 32 numeric values in voice_embedding.voiceprint.
+     */
+    private function participantHasMinVoiceprintVector(MeetingParticipant $p): bool
+    {
+        $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
+        $vp = $ve['voiceprint'] ?? null;
+        if (! is_array($vp)) {
+            return false;
+        }
+        $n = 0;
+        foreach ($vp as $v) {
+            if (is_numeric($v)) {
+                $n++;
+            }
+        }
+
+        return $n >= 32;
+    }
+
     private function persistStatsToDatabase(int $meetingId, array $stats, array $participants, int $crosstalkPercentage): void
     {
         $meeting = Meeting::query()->whereKey($meetingId)->first();
-        if (!$meeting) {
+        if (! $meeting) {
             return;
         }
 
@@ -519,7 +729,10 @@ class ProcessChunkJob implements ShouldQueue
         $speakerEmbeddings = is_array($stats['speaker_embeddings'] ?? null) ? $stats['speaker_embeddings'] : [];
         $globalEmbedding = is_array($stats['global_embedding'] ?? null) ? $stats['global_embedding'] : null;
 
-        DB::transaction(function () use ($meeting, $meetingId, $users, $participants, $crosstalkPercentage, $speakerText, $speakerEmbeddings, $globalEmbedding) {
+        /** @var array<int, array{meetingId: int, participantId: int, filePath: string, chunkIndex: int, maxSeconds: ?float, audioInputProfile: ?string}> */
+        $introVoiceprintSyncJobs = [];
+
+        DB::transaction(function () use ($meeting, $meetingId, $users, $participants, $crosstalkPercentage, $speakerText, $speakerEmbeddings, $globalEmbedding, &$introVoiceprintSyncJobs) {
             $isIntroMode = $this->mode === 'intro' || (string) ($meeting->status ?? '') === 'pending';
 
             $labelToParticipantId = [];
@@ -527,7 +740,7 @@ class ProcessChunkJob implements ShouldQueue
             // Preload voiceprints enrolled via intro so we can recognize speakers.
             $enrolledVoiceprints = $this->loadEnrolledVoiceprints($meetingId);
 
-            if (!$isIntroMode) {
+            if (! $isIntroMode) {
                 foreach ($users as $label => $seconds) {
                     $speakerLabel = (string) $label;
 
@@ -536,11 +749,11 @@ class ProcessChunkJob implements ShouldQueue
                         ->where('speaker_label', $speakerLabel)
                         ->first();
 
-                    if (!$mapping) {
+                    if (! $mapping) {
                         // Strip chunk prefix for display: "chunk2_speaker_0" → "Speaker 0"
                         $displayName = $speakerLabel;
                         if (preg_match('/^chunk\d+_speaker_(\d+)$/', $speakerLabel, $m)) {
-                            $displayName = 'Speaker ' . $m[1];
+                            $displayName = 'Speaker '.$m[1];
                         }
 
                         $participant = MeetingParticipant::create([
@@ -570,7 +783,32 @@ class ProcessChunkJob implements ShouldQueue
                 foreach ($speakerText as $label => $text) {
                     $label = (string) $label;
                     $realName = $this->extractNameFromText((string) $text);
-                    if (!$realName) {
+                    if (! $realName) {
+                        continue;
+                    }
+
+                    $minIntroSec = (float) config('meeting_voice.intro.min_duration_seconds', 1.2);
+                    if ($this->durationSeconds !== null && (float) $this->durationSeconds < $minIntroSec) {
+                        Log::info('intro_enroll_skipped_short_clip', [
+                            'meeting_id' => $meetingId,
+                            'duration_seconds' => $this->durationSeconds,
+                            'min_seconds' => $minIntroSec,
+                        ]);
+
+                        continue;
+                    }
+
+                    $minWords = max(1, (int) config('meeting_voice.intro.min_stt_words_for_enroll', 2));
+                    $wordCount = str_word_count(trim((string) $text));
+                    $vec = $speakerEmbeddings[$label] ?? $globalEmbedding ?? null;
+                    $hasAnalyzerVoiceprint = is_array($vec) && count($vec) >= 32;
+                    if ($wordCount < $minWords && ! $hasAnalyzerVoiceprint) {
+                        Log::info('intro_enroll_skipped_few_words', [
+                            'meeting_id' => $meetingId,
+                            'word_count' => $wordCount,
+                            'min_words' => $minWords,
+                        ]);
+
                         continue;
                     }
 
@@ -594,7 +832,10 @@ class ProcessChunkJob implements ShouldQueue
                     $didEmbed = false;
                     $embedEnabled = filter_var(env('MEETING_INTRO_EMBED_VOICEPRINT', false), FILTER_VALIDATE_BOOL);
                     if ($embedEnabled && $this->filePath) {
-                        $computed = $this->computeVoiceprint(Storage::path($this->filePath));
+                        $computed = MeetingAudioStorage::withLocalPath(
+                            $this->filePath,
+                            fn (string $abs) => $this->computeVoiceprint($abs),
+                        );
                         if (is_array($computed) && count($computed) >= 32) {
                             $enrolledEmbedding['voiceprint'] = array_map('floatval', $computed);
                             $enrolledEmbedding['voiceprint_dim'] = count($enrolledEmbedding['voiceprint']);
@@ -605,7 +846,7 @@ class ProcessChunkJob implements ShouldQueue
                         }
                     }
 
-                    if (!$didEmbed) {
+                    if (! $didEmbed) {
                         $vec = $speakerEmbeddings[$label] ?? null;
                         if (is_array($vec) && count($vec) >= 32) {
                             $enrolledEmbedding['voiceprint'] = array_map('floatval', $vec);
@@ -639,14 +880,19 @@ class ProcessChunkJob implements ShouldQueue
                             $curChunk = (int) $m2[1];
                         }
                         if ($prevChunk !== null && $curChunk !== null && $prevChunk !== $curChunk) {
-                            Log::warning('intro_name_collision_skipped', [
-                                'meeting_id' => $meetingId,
-                                'enrolled_name' => $realName,
-                                'speaker_label' => $curLabel,
-                                'conflicts_with_participant_id' => (int) $named->id,
-                                'conflicts_with_speaker_label' => $prevLabel,
-                            ]);
-                            continue;
+                            if ($this->participantHasMinVoiceprintVector($named)) {
+                                Log::warning('intro_name_collision_skipped', [
+                                    'meeting_id' => $meetingId,
+                                    'enrolled_name' => $realName,
+                                    'speaker_label' => $curLabel,
+                                    'conflicts_with_participant_id' => (int) $named->id,
+                                    'conflicts_with_speaker_label' => $prevLabel,
+                                ]);
+
+                                continue;
+                            }
+                            // Same name on a later chunk but still no usable vector (retries / simulator): allow
+                            // this pass so ECAPA / embeddings can run; do not block forever on chunk0 only.
                         }
                     }
 
@@ -655,7 +901,7 @@ class ProcessChunkJob implements ShouldQueue
                     // In that case, refuse to save it so we don't corrupt enrollment.
                     $newVp = $enrolledEmbedding['voiceprint'] ?? null;
                     if (is_array($newVp) && count($newVp) >= 32) {
-                        $dupThr = (float) env('MEETING_INTRO_DUPLICATE_VOICEPRINT_SIM', 0.985);
+                        $dupThr = (float) config('meeting_voice.intro.duplicate_voiceprint_sim', 0.972);
                         $dupThr = max(0.85, min(0.999, $dupThr));
                         $others = MeetingParticipant::query()
                             ->where('meeting_id', $meetingId)
@@ -667,7 +913,7 @@ class ProcessChunkJob implements ShouldQueue
                             }
                             $ove = is_array($op->voice_embedding) ? $op->voice_embedding : [];
                             $ovp = $ove['voiceprint'] ?? null;
-                            if (!is_array($ovp) || count($ovp) < 32) {
+                            if (! is_array($ovp) || count($ovp) < 32) {
                                 continue;
                             }
                             $sim = $this->cosineSimilarity($newVp, array_map('floatval', $ovp));
@@ -687,7 +933,7 @@ class ProcessChunkJob implements ShouldQueue
                         }
                     }
 
-                    if (!$named) {
+                    if (! $named) {
                         $named = MeetingParticipant::create([
                             'meeting_id' => $meetingId,
                             'user_id' => null,
@@ -725,7 +971,7 @@ class ProcessChunkJob implements ShouldQueue
                             }
 
                             // Prefer keeping the existing primary voiceprint stable; only set it if missing.
-                            if (!is_array($prev['voiceprint'] ?? null) || count((array) ($prev['voiceprint'] ?? [])) < 32) {
+                            if (! is_array($prev['voiceprint'] ?? null) || count((array) ($prev['voiceprint'] ?? [])) < 32) {
                                 $prev['voiceprint'] = $voiceprints[count($voiceprints) - 1];
                             }
                             $prev['voiceprint_dim'] = is_array($prev['voiceprint'] ?? null) ? count((array) $prev['voiceprint']) : 0;
@@ -758,21 +1004,27 @@ class ProcessChunkJob implements ShouldQueue
 
                     $labelToParticipantId[$label] = (int) $mapping->participant_id;
 
+                    $named->refresh();
+
                     // Async voiceprint compute (fast enrollment):
                     // If we didn't run the heavy embed step inline, compute SpeechBrain ECAPA in background.
-                    if (!$embedEnabled && $this->filePath) {
+                    // Use dispatchSync so Studio's ?sync=1 path (and dev without queue workers) still gets a
+                    // voice_embedding.voiceprint before the API returns; otherwise UI stays "Pending" and
+                    // MeetingController::start blocks with voiceprints_missing.
+                    if (! $embedEnabled && $this->filePath) {
                         $ve = is_array($named->voice_embedding) ? $named->voice_embedding : [];
                         $engine = strtolower(trim((string) ($ve['voiceprint_engine'] ?? $ve['engine'] ?? '')));
                         $hasVp = is_array($ve['voiceprint'] ?? null) && count((array) ($ve['voiceprint'] ?? [])) >= 32;
 
-                        if (!$hasVp || $engine !== 'speechbrain_ecapa') {
-                            ComputeIntroVoiceprintJob::dispatch(
-                                meetingId: $meetingId,
-                                participantId: (int) $named->id,
-                                filePath: (string) $this->filePath,
-                                chunkIndex: (int) $this->chunkIndex,
-                                maxSeconds: $this->durationSeconds,
-                            )->onQueue('audio');
+                        if (! $hasVp || $engine !== 'speechbrain_ecapa') {
+                            $introVoiceprintSyncJobs[(int) $named->id] = [
+                                'meetingId' => $meetingId,
+                                'participantId' => (int) $named->id,
+                                'filePath' => (string) $this->filePath,
+                                'chunkIndex' => (int) $this->chunkIndex,
+                                'maxSeconds' => $this->durationSeconds,
+                                'audioInputProfile' => $this->resolvedAudioInputProfile(),
+                            ];
                         }
                     }
                 }
@@ -780,18 +1032,18 @@ class ProcessChunkJob implements ShouldQueue
 
             // Voice recognition in meeting mode: match each label embedding to enrolled voiceprints,
             // and redirect SpeakerMappings away from placeholders when confident.
-            if (!$isIntroMode && count($enrolledVoiceprints) > 0 && count($speakerEmbeddings) > 0) {
+            if (! $isIntroMode && count($enrolledVoiceprints) > 0 && count($speakerEmbeddings) > 0) {
                 foreach ($speakerEmbeddings as $label => $vec) {
-                    if (!is_string($label) || !is_array($vec) || count($vec) === 0) {
+                    if (! is_string($label) || ! is_array($vec) || count($vec) === 0) {
                         continue;
                     }
                     $pid = $labelToParticipantId[$label] ?? null;
-                    if (!$pid) {
+                    if (! $pid) {
                         continue;
                     }
 
                     $match = $this->matchVoiceprint($vec, $enrolledVoiceprints);
-                    if (!$match) {
+                    if (! $match) {
                         continue;
                     }
 
@@ -823,10 +1075,10 @@ class ProcessChunkJob implements ShouldQueue
                 }
             }
 
-            if (!$isIntroMode) {
+            if (! $isIntroMode) {
                 foreach ($participants as $p) {
                     $label = (string) ($p['name'] ?? '');
-                    if ($label === '' || !isset($labelToParticipantId[$label])) {
+                    if ($label === '' || ! isset($labelToParticipantId[$label])) {
                         continue;
                     }
 
@@ -867,6 +1119,35 @@ class ProcessChunkJob implements ShouldQueue
                 );
             }
         });
+
+        foreach ($introVoiceprintSyncJobs as $row) {
+            Bus::dispatchSync(new ComputeIntroVoiceprintJob(
+                meetingId: $row['meetingId'],
+                participantId: $row['participantId'],
+                filePath: $row['filePath'],
+                chunkIndex: $row['chunkIndex'],
+                maxSeconds: $row['maxSeconds'],
+                audioInputProfile: $row['audioInputProfile'],
+            ));
+
+            $p = MeetingParticipant::query()->whereKey($row['participantId'])->first();
+            if ($p && ! $this->participantHasMinVoiceprintVector($p) && $this->filePath) {
+                $computed = MeetingAudioStorage::withLocalPath(
+                    $this->filePath,
+                    fn (string $abs) => $this->computeVoiceprint($abs),
+                );
+                if (is_array($computed) && count($computed) >= 32) {
+                    $prev = is_array($p->voice_embedding) ? $p->voice_embedding : [];
+                    $prev['voiceprint'] = array_map('floatval', $computed);
+                    $prev['voiceprint_dim'] = count($prev['voiceprint']);
+                    $prev['voiceprint_engine'] = is_string($this->lastVoiceprintEngine) && $this->lastVoiceprintEngine !== ''
+                        ? $this->lastVoiceprintEngine
+                        : 'speechbrain_ecapa';
+                    $prev['voiceprint_source'] = 'intro_embed_fallback';
+                    $p->update(['voice_embedding' => $prev]);
+                }
+            }
+        }
     }
 
     /**
@@ -891,12 +1172,13 @@ class ProcessChunkJob implements ShouldQueue
             (string) ($this->durationSeconds ?? 0),
         ]);
         $process->setTimeout($timeout + 20);
-        $process->setEnv(array_merge($_SERVER, $_ENV, [
+        $process->setEnv(array_merge($_SERVER, $_ENV, MlPythonEnv::forSubprocess(), [
+            'MEETING_AUDIO_INPUT_PROFILE' => strtolower(trim((string) $this->resolvedAudioInputProfile())),
             'PATH' => $this->buildPath(),
         ]));
         $process->run();
 
-        if (!$process->isSuccessful()) {
+        if (! $process->isSuccessful()) {
             Log::warning('intro_voiceprint_compute_failed', [
                 'meeting_id' => $this->meetingId,
                 'chunk_index' => $this->chunkIndex,
@@ -908,11 +1190,12 @@ class ProcessChunkJob implements ShouldQueue
                 'error_output' => trim((string) $process->getErrorOutput()),
                 'output' => trim((string) $process->getOutput()),
             ]);
+
             return null;
         }
 
         $decoded = json_decode((string) $process->getOutput(), true);
-        if (!is_array($decoded) || !is_array($decoded['embedding'] ?? null)) {
+        if (! is_array($decoded) || ! is_array($decoded['embedding'] ?? null)) {
             Log::warning('intro_voiceprint_compute_invalid_json', [
                 'meeting_id' => $this->meetingId,
                 'chunk_index' => $this->chunkIndex,
@@ -922,6 +1205,7 @@ class ProcessChunkJob implements ShouldQueue
                 'file' => $absolutePath,
                 'output' => trim((string) $process->getOutput()),
             ]);
+
             return null;
         }
 
@@ -941,6 +1225,7 @@ class ProcessChunkJob implements ShouldQueue
                 'engine' => is_string($decoded['engine'] ?? null) ? (string) $decoded['engine'] : null,
             ]);
         }
+
         return count($vec) > 0 ? $vec : null;
     }
 
@@ -962,7 +1247,7 @@ class ProcessChunkJob implements ShouldQueue
             $ve = is_array($p->voice_embedding) ? $p->voice_embedding : [];
             $engine = strtolower(trim((string) ($ve['voiceprint_engine'] ?? $ve['engine'] ?? '')));
             $vec = $ve['voiceprint'] ?? null;
-            if (!is_array($vec) || count($vec) < 32) {
+            if (! is_array($vec) || count($vec) < 32) {
                 continue;
             }
             $floats = [];
@@ -988,12 +1273,13 @@ class ProcessChunkJob implements ShouldQueue
                 'vector' => $floats,
             ];
         }
+
         return $out;
     }
 
     /**
-     * @param array<int,float> $a
-     * @param array<int,float> $b
+     * @param  array<int,float>  $a
+     * @param  array<int,float>  $b
      */
     private function cosineSimilarity(array $a, array $b): float
     {
@@ -1014,12 +1300,13 @@ class ProcessChunkJob implements ShouldQueue
         if ($na <= 0.0 || $nb <= 0.0) {
             return 0.0;
         }
+
         return $dot / (sqrt($na) * sqrt($nb));
     }
 
     /**
-     * @param array<int,float> $vec
-     * @param array<int,array{participant_id:int,vector:array<int,float>}> $enrolled
+     * @param  array<int,float>  $vec
+     * @param  array<int,array{participant_id:int,vector:array<int,float>}>  $enrolled
      * @return array{0:int,1:float}|null
      */
     private function matchVoiceprint(array $vec, array $enrolled): ?array
@@ -1036,11 +1323,11 @@ class ProcessChunkJob implements ShouldQueue
                 continue;
             }
             $vec2 = $e['vector'] ?? null;
-            if (!is_array($vec2) || count($vec2) < 32) {
+            if (! is_array($vec2) || count($vec2) < 32) {
                 continue;
             }
             $score = $this->cosineSimilarity($vec, $vec2);
-            if (!isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
+            if (! isset($bestByPid[$pid]) || $score > (float) $bestByPid[$pid]) {
                 $bestByPid[$pid] = (float) $score;
             }
         }
@@ -1067,7 +1354,7 @@ class ProcessChunkJob implements ShouldQueue
 
     private function persistTranscriptToDatabase(int $meetingId, array $analysis): void
     {
-        if (!Meeting::query()->whereKey($meetingId)->exists()) {
+        if (! Meeting::query()->whereKey($meetingId)->exists()) {
             return;
         }
 
@@ -1085,26 +1372,36 @@ class ProcessChunkJob implements ShouldQueue
         $labelToName = [];
         foreach ($rows as $r) {
             $lbl = (string) ($r->speaker_label ?? '');
-            if ($lbl === '') continue;
+            if ($lbl === '') {
+                continue;
+            }
             $labelToName[$lbl] = (string) ($r->participant?->name ?? $lbl);
         }
 
-        $text = trim(implode("\n", array_map(
-            fn ($label, $t) => '[' . (string) ($labelToName[(string) $label] ?? $label) . '] ' . trim((string) $t),
-            array_keys($speakerText),
-            array_values($speakerText),
-        )));
+        $mappedLines = [];
+        foreach ($speakerText as $label => $t) {
+            $lineText = trim((string) $t);
+            if ($lineText === '') {
+                continue;
+            }
+            $lbl = (string) $label;
+            $name = (string) ($labelToName[$lbl] ?? $lbl);
+            $mappedLines[] = [
+                'label' => $lbl,
+                'name' => $name,
+                'text' => $lineText,
+            ];
+        }
 
-        if ($text === '') {
+        if ($mappedLines === []) {
             return;
         }
 
         $chunkSeconds = (float) ((int) ($analysis['total_seconds'] ?? 0));
-        Transcript::create([
-            'meeting_id' => $meetingId,
-            'text' => $text,
-            'start_time' => 0.0,
-            'end_time' => max(0.0, $chunkSeconds),
-        ]);
+        \App\Support\LiveTranscriptWriter::persistRelayLines(
+            $meetingId,
+            $mappedLines,
+            max(0.0, $chunkSeconds),
+        );
     }
 }

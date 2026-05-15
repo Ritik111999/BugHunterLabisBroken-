@@ -1,27 +1,26 @@
 <?php
 
-use App\Http\Controllers\Api\ForgotPasswordController;
+use App\Http\Controllers\Api\AccountDeletionController;
+use App\Http\Controllers\Api\AnalyticsController;
+use App\Http\Controllers\Api\AudioChunkController;
+use App\Http\Controllers\Api\AudioController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ContactController;
-use App\Http\Controllers\Api\FaqController;
-use App\Http\Controllers\Api\PageController;
-use App\Http\Controllers\Api\ProfileController;
-
 // NEW Controllers
-use App\Http\Controllers\Api\MeetingController;
-use App\Http\Controllers\Api\ParticipantController;
-use App\Http\Controllers\Api\AudioController;
-use App\Http\Controllers\Api\AudioChunkController;
-use App\Http\Controllers\Api\AnalyticsController;
-use App\Http\Controllers\Api\MeetingStatsController;
-use App\Http\Controllers\Api\SpeakerMappingController;
-use App\Http\Controllers\Api\TranscriptController;
-use App\Http\Controllers\Api\IntroChunkController;
+use App\Http\Controllers\Api\FaqController;
+use App\Http\Controllers\Api\ForgotPasswordController;
 use App\Http\Controllers\Api\InAppPurchaseController;
-use App\Http\Controllers\Api\SubscriptionPlanController;
-use App\Http\Controllers\Api\AccountDeletionController;
+use App\Http\Controllers\Api\IntroChunkController;
+use App\Http\Controllers\Api\MeetingController;
+use App\Http\Controllers\Api\MeetingServicesHealthController;
+use App\Http\Controllers\Api\MeetingStatsController;
+use App\Http\Controllers\Api\PageController;
+use App\Http\Controllers\Api\ParticipantController;
+use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\PublicDeleteAccountController as ApiPublicDeleteAccountController;
-
+use App\Http\Controllers\Api\SpeakerMappingController;
+use App\Http\Controllers\Api\SubscriptionPlanController;
+use App\Http\Controllers\Api\TranscriptController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -48,14 +47,13 @@ Route::middleware('throttle:public-delete-account')->group(function () {
     Route::post('/public/delete-account-request', [ApiPublicDeleteAccountController::class, 'store']);
 });
 
-
 /*
 |--------------------------------------------------------------------------
 | Protected Routes (Auth Required)
 |--------------------------------------------------------------------------
 */
 
-Route::middleware('api.auth')->group(function () {
+Route::middleware(['api.auth', 'throttle:api-authenticated'])->group(function () {
 
     /*
     |----------------------------------
@@ -79,15 +77,17 @@ Route::middleware('api.auth')->group(function () {
     */
     Route::post('/contact', [ContactController::class, 'store']);
 
-
     /*
     |----------------------------------
     | Meetings
     |----------------------------------
     */
 
+    Route::get('/health/meeting-services', [MeetingServicesHealthController::class, 'show']);
+    Route::get('/meetings/search', [\App\Http\Controllers\Api\MeetingSearchController::class, 'search']);
+
     // list meetings
-    Route::get('/meetings', [MeetingController::class, 'index']); 
+    Route::get('/meetings', [MeetingController::class, 'index']);
 
     // Create meeting
     Route::post('/meetings', [MeetingController::class, 'create']);
@@ -98,11 +98,11 @@ Route::middleware('api.auth')->group(function () {
     // End meeting
     Route::post('/meetings/{id}/end', [MeetingController::class, 'end']);
 
-    // Get single meeting details 
+    // Get single meeting details
     Route::get('/meetings/{id}', [MeetingController::class, 'show']);
 
     // delete meeting
-    Route::delete('/meetings/{id}', [MeetingController::class, 'delete']); 
+    Route::delete('/meetings/{id}', [MeetingController::class, 'delete']);
 
     /*
     |----------------------------------
@@ -116,7 +116,6 @@ Route::middleware('api.auth')->group(function () {
     // Get participants of meeting
     Route::get('/meetings/{id}/participants', [ParticipantController::class, 'list']);
 
-
     /*
     |----------------------------------
     | Audio Upload
@@ -126,7 +125,6 @@ Route::middleware('api.auth')->group(function () {
     Route::post('/audio/upload', [AudioController::class, 'upload']);
     Route::post('/audio/chunk', [AudioChunkController::class, 'storeChunk']);
     Route::post('/meetings/{id}/intro/chunk', [IntroChunkController::class, 'store']);
-
 
     /*
     |----------------------------------
@@ -143,6 +141,7 @@ Route::middleware('api.auth')->group(function () {
     Route::get('/meetings/{id}/speakers', [SpeakerMappingController::class, 'list']);
     Route::post('/meetings/{id}/speakers/map', [SpeakerMappingController::class, 'map']);
     Route::get('/meetings/{id}/transcripts', [TranscriptController::class, 'list']);
+    Route::get('/meetings/{id}/transcripts/stream', [TranscriptController::class, 'stream']);
 
     /*
     |--------------------------------------------------------------------------

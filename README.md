@@ -1,58 +1,83 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# WeChirp (Meet)
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Laravel backend (REST API, admin, meeting pipeline), Vite + Tailwind for web UI, optional **Capacitor** iOS/Android shells. Realtime meetings use a small **PHP WebSocket relay** (`php artisan deepgram:relay`) alongside `php artisan serve`.
 
-## About Laravel
+**This repository does not use Docker.** Run PHP, Node, and (for mobile) Xcode/Android Studio directly on your machine.
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## Requirements
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+- **PHP** 8.3+ with common extensions (`pdo_sqlite` or `pdo_mysql`, `mbstring`, `openssl`, `tokenizer`, `xml`, `ctype`, `json`, `bcmath`)
+- **Composer** 2.x  
+- **Node.js** 20+ and **npm**  
+- **SQLite** (default in `.env.example`) or MySQL/Postgres if you change `DB_*`  
+- **Mobile (optional):** Xcode (iOS), Android Studio (Android) — see [`mobile/README.md`](mobile/README.md)
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+## First-time setup (local)
 
-## Learning Laravel
-
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
-
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+From the repository root:
 
 ```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+composer run setup
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+That installs PHP and JS dependencies, creates `.env` from `.env.example` if missing, generates `APP_KEY`, ensures `database/database.sqlite` exists, runs migrations, and builds frontend assets.
 
-## Contributing
+Then edit `.env`: set `APP_NAME`, `APP_URL`, and at minimum `DEEPGRAM_API_KEY` if you use live/batch STT features.
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+First-time **Capacitor** dependencies:
 
-## Code of Conduct
+```bash
+cd mobile && npm install && npx cap sync
+```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+## Daily development
 
-## Security Vulnerabilities
+```bash
+composer run dev
+```
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+Starts together: **HTTP server** (port **9000**), **queue worker** (`audio` + `default` queues for intro/meeting chunks), **Pail** logs, **Vite** (port **9002**), and the **Deepgram relay** (WebSocket on port **9001**). Stop the terminal with **Ctrl+C** when you are done (if the relay fails because port 9001 is already in use, the other processes keep running—stop the old relay or pick another port).
+
+- Web: [http://127.0.0.1:9000](http://127.0.0.1:9000) — **consumer app (React):** [http://127.0.0.1:9000/app](http://127.0.0.1:9000/app) — meeting tools / studio: [http://127.0.0.1:9000/demo](http://127.0.0.1:9000/demo)  
+- Admin sign-in is the default `/` redirect.
+
+Minimal stack (separate terminals or tabs) if you prefer not to use `concurrently`:
+
+```bash
+php artisan serve --host=127.0.0.1 --port=9000
+php artisan queue:listen --tries=1 --timeout=0 --queue=audio,default
+php artisan deepgram:relay --host=127.0.0.1 --port=9001
+```
+
+Use `npm run dev` when changing Vite/Tailwind sources.
+
+### iOS Simulator (Capacitor)
+
+Boot a simulator in **Simulator.app**, then from the repo root:
+
+```bash
+npm run dev:ios
+```
+
+That runs `npm run build`, starts Laravel on **9000** and a queue worker if needed, syncs `mobile/ios`, and deploys to the booted device. The script keeps running until **Ctrl+C** (so PHP + queue stay up while you test). Equivalent: `composer run dev:ios`.
+
+## Technology stack
+
+WeChirp is built on a fixed product stack: **Deepgram** (live + batch STT), **OpenAI** (structured meeting summaries + semantic search), **SpeechBrain** voiceprints (Python), **Laravel** API + Amp relay, **React + Capacitor** client. See [`docs/wechirp-stack.md`](docs/wechirp-stack.md) and [`config/wechirp.php`](config/wechirp.php). Production: [`.env.production.example`](.env.production.example) and [`docs/wechirp-production.md`](docs/wechirp-production.md).
+
+## Useful docs in-repo
+
+- [`docs/wechirp-stack.md`](docs/wechirp-stack.md) — official providers, data flow, production checklist  
+- [`mobile/README.md`](mobile/README.md) — Capacitor URLs, simulator vs device, `server.url`  
+- [`postman/README.md`](postman/README.md) — API + relay WebSocket  
+- [`docs/audio-realtime.md`](docs/audio-realtime.md) — realtime audio path  
+
+## Tests
+
+```bash
+composer run test
+```
 
 ## License
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+MIT. Laravel components remain under the [Laravel license](https://opensource.org/licenses/MIT).

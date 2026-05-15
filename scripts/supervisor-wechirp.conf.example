@@ -1,0 +1,31 @@
+; Copy to /etc/supervisor/conf.d/wechirp.conf and adjust paths/user.
+; supervisorctl reread && supervisorctl update
+
+[program:wechirp-http]
+command=php /var/www/wechirp/artisan serve --host=0.0.0.0 --port=9000
+directory=/var/www/wechirp
+user=www-data
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/var/log/wechirp/http.log
+
+[program:wechirp-queue]
+command=/var/www/wechirp/scripts/production-queue-worker.sh
+directory=/var/www/wechirp
+user=www-data
+autostart=true
+autorestart=true
+numprocs=2
+process_name=%(program_name)s_%(process_num)02d
+redirect_stderr=true
+stdout_logfile=/var/log/wechirp/queue.log
+
+[program:wechirp-relay]
+command=php /var/www/wechirp/artisan deepgram:relay --host=127.0.0.1 --port=9001
+directory=/var/www/wechirp
+user=www-data
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/var/log/wechirp/relay.log

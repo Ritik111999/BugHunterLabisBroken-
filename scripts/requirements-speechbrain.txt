@@ -1,5 +1,9 @@
+# Core voiceprint stack (intro enrollment + live matching).
+# Install: scripts/setup-voiceprint.sh
 numpy
 torch
 torchaudio
 speechbrain
-deepfilternet
+
+# Optional noise suppression (needs Rust/cargo to build deepfilterlib on some Macs).
+# deepfilternet

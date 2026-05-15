@@ -34,6 +34,19 @@ import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def meeting_audio_af_filters() -> str:
+    """
+    FFmpeg -af chain for 16 kHz mono decode prior to STT / ECAPA.
+    MEETING_AUDIO_INPUT_PROFILE: default | bluetooth | wired (aliases: bt, wireless, usb, …).
+    """
+    p = (os.getenv("MEETING_AUDIO_INPUT_PROFILE", "default") or "default").strip().lower()
+    if p in ("bluetooth", "bt", "wireless", "headset"):
+        return "highpass=f=80,loudnorm=I=-14:LRA=12:TP=-1.2"
+    if p in ("wired", "line", "usb", "studio"):
+        return "highpass=f=40,loudnorm=I=-17:LRA=10:TP=-1.5"
+    return "highpass=f=60,loudnorm=I=-16:LRA=11:TP=-1.5"
+
+
 def run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -236,11 +249,9 @@ def _compute_speaker_embeddings(
             cut = int(max(0.0, intro_seconds) * sr)
             wav = wav[:, min(cut, wav.shape[1]) :]
 
-        # SpeechBrain model (downloads on first run).
-        classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"},
-        )
+        from ml_paths import load_ecapa_classifier
+
+        classifier = load_ecapa_classifier()
 
         out: Dict[str, List[float]] = {}
         for label, intervals in speaker_intervals.items():
@@ -316,10 +327,9 @@ def _compute_global_embedding(audio_path: str, intro_seconds: float, timeout: in
         if wav.shape[1] < int(1.0 * sr):
             return None
 
-        classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"},
-        )
+        from ml_paths import load_ecapa_classifier
+
+        classifier = load_ecapa_classifier()
 
         with torch.inference_mode():
             emb = classifier.encode_batch(wav)
@@ -339,13 +349,19 @@ def _compute_global_embedding(audio_path: str, intro_seconds: float, timeout: in
                 pass
 
 
-def _convert_to_wav_mono_16k_loudnorm(src_path: str, timeout: int, max_seconds: Optional[float] = None) -> str:
+def _convert_to_wav_mono_16k_loudnorm(
+    src_path: str,
+    timeout: int,
+    max_seconds: Optional[float] = None,
+    af_filters: Optional[str] = None,
+) -> str:
     """
     Convert to a temporary 16kHz mono WAV and normalize loudness.
     This makes quiet mic recordings transcribe better.
     """
     fd, wav_path = tempfile.mkstemp(prefix="wchirp_norm_", suffix=".wav")
     os.close(fd)
+    af = af_filters if af_filters else meeting_audio_af_filters()
     cp = run(
         [
             "ffmpeg",
@@ -353,6 +369,8 @@ def _convert_to_wav_mono_16k_loudnorm(src_path: str, timeout: int, max_seconds: 
             "-hide_banner",
             "-loglevel",
             "error",
+            "-fflags",
+            "+genpts",
             "-i",
             src_path,
             *([] if max_seconds is None else ["-t", str(float(max_seconds))]),
@@ -361,7 +379,7 @@ def _convert_to_wav_mono_16k_loudnorm(src_path: str, timeout: int, max_seconds: 
             "-ar",
             "16000",
             "-af",
-            "loudnorm=I=-16:LRA=11:TP=-1.5",
+            af,
             wav_path,
         ],
         timeout=timeout,
@@ -373,6 +391,32 @@ def _convert_to_wav_mono_16k_loudnorm(src_path: str, timeout: int, max_seconds: 
             pass
         raise RuntimeError(cp.stderr.strip() or "ffmpeg loudnorm failed")
     return wav_path
+
+
+def _deepgram_fallback_transcript(results: Dict[str, Any]) -> str:
+    """
+    When utterance diarization yields no stitched text, Deepgram often still returns
+    a channel-level transcript or word list on alternatives[0].
+    """
+    try:
+        channels = (results or {}).get("channels") or []
+        if not isinstance(channels, list) or not channels:
+            return ""
+        alt0 = ((channels[0] or {}).get("alternatives") or [{}])[0] or {}
+        t = str(alt0.get("transcript") or "").strip()
+        if t:
+            return t
+        words = alt0.get("words") or []
+        if not isinstance(words, list):
+            return ""
+        parts: List[str] = []
+        for w in words:
+            if not isinstance(w, dict):
+                continue
+            parts.append(str(w.get("punctuated_word") or w.get("word") or "").strip())
+        return " ".join(x for x in parts if x).strip()
+    except Exception:
+        return ""
 
 
 def run_deepgram_diarization(
@@ -387,12 +431,23 @@ def run_deepgram_diarization(
     Uses Deepgram diarization. Returns (speaker_seconds, overlap_seconds).
     Speaker keys are "speaker_0", "speaker_1", ...
     """
-    params = {
-        "model": "nova-2",
-        "diarize": "true",
-        "utterances": "true",
-        "punctuate": "false",
-    }
+    dg_model = (os.getenv("MEETING_DEEPGRAM_PRERECORD_MODEL", "nova-2") or "nova-2").strip()
+    is_intro = str(mode).lower() == "intro"
+    params: Dict[str, str] = {"model": dg_model}
+    if is_intro:
+        # Short mono enrollment clips: diarization often yields empty utterances/transcripts
+        # even when the channel transcript is fine. Single-speaker STT is more reliable.
+        lang = (os.getenv("MEETING_DEEPGRAM_LANGUAGE", "en") or "en").strip()
+        if lang:
+            params["language"] = lang
+        params["diarize"] = "false"
+        params["utterances"] = "true"
+        # smart_format implies punctuation for English; improves readable phrases for name extraction.
+        params["smart_format"] = "true"
+    else:
+        params["diarize"] = "true"
+        params["utterances"] = "true"
+        params["punctuate"] = "false"
     url = "https://api.deepgram.com/v1/listen?" + urllib.parse.urlencode(params)
 
     # For intro enrollment, normalize loudness to avoid "speak very loud" issues.
@@ -473,7 +528,15 @@ def run_deepgram_diarization(
             per_speaker_seconds[key] = per_speaker_seconds.get(key, 0.0) + (end - start)
             per_speaker_intervals.setdefault(key, []).append((start, end))
             all_intervals.append((start, end))
-            t = str(u.get("transcript") or "").strip()
+            t = str(u.get("transcript") or u.get("text") or "").strip()
+            if not t:
+                words_u = u.get("words") if isinstance(u.get("words"), list) else []
+                parts: List[str] = []
+                for ww in words_u:
+                    if not isinstance(ww, dict):
+                        continue
+                    parts.append(str(ww.get("punctuated_word") or ww.get("word") or "").strip())
+                t = " ".join(x for x in parts if x).strip()
             if t:
                 per_speaker_text[key] = (per_speaker_text.get(key, "") + " " + t).strip()
     else:
@@ -520,12 +583,60 @@ def run_deepgram_diarization(
             if t:
                 per_speaker_text[key] = (per_speaker_text.get(key, "") + " " + t).strip()
 
-    # Use rounding so short chunks don't collapse to 0s per speaker.
-    speaker_seconds_int = {k: max(1, int(round(v))) for k, v in per_speaker_seconds.items() if v > 0.0}
     overlap_seconds = _compute_overlap_seconds(all_intervals)
     inferred_duration = None
     if len(all_intervals) > 0:
         inferred_duration = max(e for _s, e in all_intervals)
+
+    # Utterances can be non-empty while each `transcript` is blank; channel alternative still has text.
+    if not any(str(v).strip() for v in per_speaker_text.values()):
+        fb = _deepgram_fallback_transcript(results)
+        if fb:
+            per_speaker_text["speaker_0"] = fb
+            if not per_speaker_seconds:
+                dur = float(inferred_duration or 0.0)
+                per_speaker_seconds["speaker_0"] = max(1.0, min(120.0, dur if dur > 0.5 else 3.0))
+
+    # Intro: one retry with stronger gain when WebView uploads decode but STT is empty.
+    if is_intro and not any(str(v).strip() for v in per_speaker_text.values()):
+        retry_norm = None
+        try:
+            retry_norm = _convert_to_wav_mono_16k_loudnorm(
+                path,
+                timeout=timeout,
+                max_seconds=max_seconds,
+                af_filters="highpass=f=80,volume=3,loudnorm=I=-14:LRA=12:TP=-1.2",
+            )
+            with open(retry_norm, "rb") as f:
+                retry_bytes = f.read()
+            retry_req = urllib.request.Request(
+                url=url,
+                data=retry_bytes,
+                method="POST",
+                headers={
+                    "Authorization": f"Token {api_key}",
+                    "Content-Type": "audio/wav",
+                },
+            )
+            with urllib.request.urlopen(retry_req, timeout=timeout) as resp:
+                retry_payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            retry_results = (retry_payload or {}).get("results") or {}
+            retry_fb = _deepgram_fallback_transcript(retry_results)
+            if retry_fb:
+                per_speaker_text["speaker_0"] = retry_fb
+                if not per_speaker_seconds:
+                    per_speaker_seconds["speaker_0"] = 3.0
+        except Exception:
+            pass
+        finally:
+            if retry_norm:
+                try:
+                    os.unlink(retry_norm)
+                except Exception:
+                    pass
+
+    # Use rounding so short chunks don't collapse to 0s per speaker.
+    speaker_seconds_int = {k: max(1, int(round(v))) for k, v in per_speaker_seconds.items() if v > 0.0}
     try:
         return speaker_seconds_int, overlap_seconds, per_speaker_text, per_speaker_intervals, inferred_duration
     finally:

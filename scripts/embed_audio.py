@@ -27,6 +27,30 @@ _ECAPA = None
 _SILERO_VAD = None
 
 
+def meeting_audio_af_filters() -> str:
+    p = (os.getenv("MEETING_AUDIO_INPUT_PROFILE", "default") or "default").strip().lower()
+    if p in ("bluetooth", "bt", "wireless", "headset"):
+        return "highpass=f=80,loudnorm=I=-14:LRA=12:TP=-1.2"
+    if p in ("wired", "line", "usb", "studio"):
+        return "highpass=f=40,loudnorm=I=-17:LRA=10:TP=-1.5"
+    return "highpass=f=60,loudnorm=I=-16:LRA=11:TP=-1.5"
+
+
+def embed_target_rms() -> float:
+    raw = (os.getenv("MEETING_EMBED_TARGET_RMS", "") or "").strip()
+    if raw:
+        try:
+            return max(0.02, min(0.2, float(raw)))
+        except ValueError:
+            pass
+    p = (os.getenv("MEETING_AUDIO_INPUT_PROFILE", "default") or "default").strip().lower()
+    if p in ("bluetooth", "bt", "wireless", "headset"):
+        return 0.11
+    if p in ("wired", "line", "usb", "studio"):
+        return 0.07
+    return 0.08
+
+
 def rms_normalize(samples: list[float], target_rms: float = 0.08) -> list[float]:
     """
     Lightweight normalization to reduce embedding variance across devices.
@@ -86,7 +110,7 @@ def convert_to_wav_16k_mono(src_path: str, timeout: int, max_seconds: float = 6.
             "-ar",
             "16000",
             "-af",
-            "loudnorm=I=-16:LRA=11:TP=-1.5",
+            meeting_audio_af_filters(),
             wav_path,
         ],
         timeout=timeout,
@@ -229,15 +253,10 @@ def get_ecapa():
     global _ECAPA
     if _ECAPA is not None:
         return _ECAPA
-    import torch  # type: ignore
-    from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
+    from ml_paths import load_ecapa_classifier
 
-    # SpeechBrain may print download progress; keep stdout JSON-only.
     with contextlib.redirect_stdout(sys.stderr):
-        _ECAPA = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"},
-        )
+        _ECAPA = load_ecapa_classifier()
     return _ECAPA
 
 
@@ -281,16 +300,23 @@ def main() -> int:
                 max_s = float(args.max_seconds or 0.0)
                 max_s = 6.0 if max_s <= 0 else max(1.0, min(60.0, max_s))
                 samples = try_deepfilternet(samples, 16000)
-                samples = select_speech_only(samples, 16000, max_seconds=max_s)
-                # Reject silence / no-speech to avoid creating "same for everyone" embeddings.
-                if not samples:
-                    result = {"error": "voice_missing"}
-                    raise RuntimeError("voice_missing")
-                rms = compute_rms(samples)
-                if rms < 3e-3:
-                    result = {"error": "voice_missing", "rms": float(rms)}
-                    raise RuntimeError("voice_missing")
-                samples = rms_normalize(samples)
+                skip_gate = (os.getenv("MEETING_EMBED_SKIP_VOICE_GATE", "") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                )
+                if not skip_gate:
+                    samples = select_speech_only(samples, 16000, max_seconds=max_s)
+                    # Reject silence / no-speech to avoid creating "same for everyone" embeddings.
+                    if not samples:
+                        result = {"error": "voice_missing"}
+                        raise RuntimeError("voice_missing")
+                    rms = compute_rms(samples)
+                    if rms < 3e-3:
+                        result = {"error": "voice_missing", "rms": float(rms)}
+                        raise RuntimeError("voice_missing")
+                samples = rms_normalize(samples, embed_target_rms())
 
                 wav = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)  # [1, T]
                 classifier = get_ecapa()

@@ -87,6 +87,8 @@ class AnalyticsController extends Controller
         }
         $analytic = $analyticQuery->orderByDesc('created_at')->first();
 
+        $insights = is_array($analytic?->insights) ? $analytic->insights : [];
+
         return response()->json([
             'participants'         => $stats,
             'crosstalk_percentage' => (float) ($analytic?->crosstalk_percentage ?? 0),
@@ -95,6 +97,12 @@ class AnalyticsController extends Controller
             'summary'              => $analytic?->summary ?? '',
             'action_items'         => $analytic?->action_items ?? [],
             'sentiment'            => $analytic?->sentiment ?? null,
+            'insights'             => $insights,
+            'title'                => (string) ($insights['title'] ?? ''),
+            'topics'               => is_array($insights['topics'] ?? null) ? $insights['topics'] : [],
+            'decisions'            => is_array($insights['decisions'] ?? null) ? $insights['decisions'] : [],
+            'follow_ups'           => is_array($insights['follow_ups'] ?? null) ? $insights['follow_ups'] : [],
+            'questions'            => is_array($insights['questions'] ?? null) ? $insights['questions'] : [],
             'source'               => 'db',
         ]);
     }

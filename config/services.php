@@ -53,4 +53,35 @@ return [
         'bin' => env('PYTHON_BIN'),
     ],
 
+    /*
+    | Meeting demo + Capacitor: Deepgram relay (host/port + computed WS URL).
+    | Start relay: php artisan deepgram:relay (uses relay_host / relay_port below).
+    */
+    'wechirp' => [
+        'relay_host' => env('WC_RELAY_HOST', '127.0.0.1'),
+        'relay_port' => (int) env('WC_RELAY_PORT', 9001),
+        'relay_ws_url' => (function (): string {
+            $explicit = trim((string) env('WC_RELAY_WS_URL', ''));
+            if ($explicit !== '') {
+                return $explicit;
+            }
+            $host = (string) env('WC_RELAY_HOST', '127.0.0.1');
+            $port = (int) env('WC_RELAY_PORT', 9001);
+            $appUrl = trim((string) env('APP_URL', ''));
+            if (str_starts_with($appUrl, 'https://')) {
+                $parsed = parse_url($appUrl);
+                $wssHost = (string) ($parsed['host'] ?? $host);
+
+                return sprintf('wss://%s:%d', $wssHost, $port);
+            }
+
+            return sprintf('ws://%s:%d', $host, $port);
+        })(),
+        /*
+        | Appended to the Capacitor WebView user agent so Laravel can skip Vite "hot"
+        | (127.0.0.1:9002 in dev) and serve built /public/build assets — required for iOS Simulator.
+        */
+        'native_shell_ua_token' => env('WECHIRP_NATIVE_UA_TOKEN', 'WeChirpCapacitorShell'),
+    ],
+
 ];
